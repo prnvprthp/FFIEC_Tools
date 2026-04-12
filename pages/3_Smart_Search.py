@@ -47,7 +47,11 @@ DB_URL = st.secrets["DB_URL"]
 # Ensure we are hitting the correct schema
 if "/test" in DB_URL:
     DB_URL = DB_URL.replace("/test", "/ffiec_data")
-engine = create_engine(DB_URL)
+
+connect_args = {}
+if "tidbcloud.com" in DB_URL:
+    connect_args = {"ssl": {"fake_config": True}}
+engine = create_engine(DB_URL, connect_args=connect_args)
 
 # --- Helper: Check if Ollama is running ---
 def is_ollama_online(url="localhost", port=11434):

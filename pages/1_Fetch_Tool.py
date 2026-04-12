@@ -17,7 +17,10 @@ API_TOKEN = st.secrets.get("FFIEC_TOKEN", "")
 
 @st.cache_resource
 def get_db_engine():
-    return create_engine(DB_URL, pool_pre_ping=True)
+    connect_args = {}
+    if "tidbcloud.com" in DB_URL:
+        connect_args = {"ssl": {"fake_config": True}}
+    return create_engine(DB_URL, connect_args=connect_args, pool_pre_ping=True)
 
 try:
     engine = get_db_engine()

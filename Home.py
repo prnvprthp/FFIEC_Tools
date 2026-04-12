@@ -13,7 +13,14 @@ def get_latest_parsed_date():
     """Queries the database to find the most recently parsed Call Report date."""
     try:
         DB_URL = st.secrets["DB_URL"]
-        engine = create_engine(DB_URL)
+        
+        # TiDB Cloud requires SSL. Pymysql uses 'ssl_ca' or 'ssl' dict.
+        # If using pymysql, we pass connect_args
+        connect_args = {}
+        if "tidbcloud.com" in DB_URL:
+            connect_args = {"ssl": {"fake_config": True}} # Standard placeholder for many providers
+            
+        engine = create_engine(DB_URL, connect_args=connect_args)
         with engine.connect() as conn:
             # Query the max report_date from the financials table
             result = conn.execute(text("SELECT MAX(report_date) FROM call_reports_financials")).scalar()
