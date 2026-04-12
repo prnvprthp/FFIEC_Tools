@@ -7,34 +7,24 @@ import re
 from sqlalchemy import create_engine, text
 
 # Import the background processing engine
-from update_engine import run_bulk_download, run_bulk_parse
+from update_engine import run_bulk_download, run_bulk_parse, deduplicate_data, wipe_period, get_db_engine, setup_database
 
 def get_latest_parsed_date():
-    """Queries the database to find the most recently parsed Call Report date."""
+    """Queries the migration log to find the most recently COMPLETED report date."""
     try:
         DB_URL = st.secrets["DB_URL"]
-        
-        # TiDB Cloud requires SSL. Pymysql uses 'ssl_ca' or 'ssl' dict.
-        # If using pymysql, we pass connect_args
-        connect_args = {}
-        if "tidbcloud.com" in DB_URL:
-            connect_args = {"ssl": {"fake_config": True}} # Standard placeholder for many providers
-            
-        engine = create_engine(DB_URL, connect_args=connect_args)
+        engine = get_db_engine(DB_URL)
         with engine.connect() as conn:
-            # Query the max report_date from the financials table
-            result = conn.execute(text("SELECT MAX(report_date) FROM call_reports_financials")).scalar()
+            # Check the migration log for the latest COMPLETED date
+            result = conn.execute(text("SELECT MAX(report_date) FROM migration_log WHERE status = 'COMPLETED'")).scalar()
             if result:
-                # Handle both string (MMDDYYYY) and date/datetime objects
-                if isinstance(result, (datetime.date, datetime.datetime)):
-                    return result if isinstance(result, datetime.date) else result.date()
-                
-                # If it's a string like '12312023'
-                match = re.search(r'(\d{8})', str(result))
+                # Format: MM/DD/YYYY
+                match = re.search(r'(\d{2})/(\d{2})/(\d{4})', str(result))
                 if match:
-                    return datetime.datetime.strptime(match.group(1), "%m%d%Y").date()
+                    m, d, y = match.groups()
+                    return datetime.date(int(y), int(m), int(d))
     except Exception:
-        pass # Fall back to today's date if DB is empty or unreachable
+        pass 
         
     return datetime.date.today()
 
@@ -163,7 +153,8 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
         st.balloons()
 
     except Exception as e:
-        status_text.error(f"An error occurred: {e}")
+        status_text.error(f"❌ Process Failed: {e}")
+        st.exception(e) # Show full traceback in the app for debugging
 
     finally:
         # Cleanup
@@ -186,3 +177,74 @@ with col2:
         st.switch_page("pages/3_Smart_Search.py")
 
 st.markdown("---")
+
+# ==========================================
+# TOOL 4: DATABASE MAINTENANCE
+# ==========================================
+st.subheader("🛠️ Database Maintenance")
+st.write("Manage database health, deduplicate records, or reset specific periods.")
+
+with st.expander("Show Maintenance Tools"):
+    m_col1, m_col2 = st.columns(2)
+
+    with m_col1:
+        st.markdown("### 🧹 Clean Data")
+        st.write("Remove exact duplicate records from the financials table to ensure data integrity.")
+        # Fixed height spacer to align buttons
+        st.markdown("<div style='height: 45px;'></div>", unsafe_allow_html=True)
+
+        if st.button("Run Global Deduplication", use_container_width=True):
+            status_box = st.empty()
+            prog_bar = st.progress(0.0)
+            try:
+                for msg, prog, count in deduplicate_data():
+                    status_box.info(msg)
+                    prog_bar.progress(prog)
+                st.success(f"Deduplication complete!")
+            except Exception as e:
+                st.error(f"Deduplication failed: {e}")
+
+    with m_col2:
+        st.markdown("### 🔄 Reset Data")
+        st.write("Wipe all data for a specific period. Use this if a download was corrupted or partial.")
+
+        # Fetch available dates with a loading indicator
+        date_options = []
+        with st.spinner("🔍 Checking database for available periods..."):
+            try:
+                # Ensure tables exist
+                setup_database()
+                
+                DB_URL = st.secrets["DB_URL"]
+                engine = get_db_engine(DB_URL)
+                with engine.connect() as conn:
+                    # Try to get dates individually to avoid entire query failing if one table is missing
+                    all_dates = set()
+                    
+                    # Check financials
+                    try:
+                        res = conn.execute(text("SELECT DISTINCT report_date FROM call_reports_financials")).fetchall()
+                        for r in res: all_dates.add(r[0])
+                    except: pass
+                    
+                    # Check log
+                    try:
+                        res = conn.execute(text("SELECT DISTINCT report_date FROM migration_log")).fetchall()
+                        for r in res: all_dates.add(r[0])
+                    except: pass
+                    
+                    date_options = sorted(list(all_dates), reverse=True)
+            except Exception:
+                pass
+
+        selected_wipe = st.selectbox("Select Period", options=date_options if date_options else ["No data found"])
+        
+        if not date_options:
+            st.info("💡 No report dates found in the database. Run a download first!")
+
+        if st.button("Wipe Selected Period", type="secondary", use_container_width=True, disabled=not date_options):
+            if selected_wipe and selected_wipe != "No data found":
+                with st.spinner(f"Wiping {selected_wipe}..."):
+                    wipe_period(selected_wipe)
+                    st.success(f"Reset {selected_wipe}!")
+                    st.rerun()

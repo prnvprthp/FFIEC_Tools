@@ -5,13 +5,14 @@ import zipfile
 import shutil
 import json
 import csv
+import re
 from datetime import datetime
 import xml.etree.ElementTree as ET
-import mysql.connector
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import streamlit as st
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -20,80 +21,166 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # --- Database Configuration ---
-DB_HOST     = "localhost" 
-DB_PORT     = 3306
-DB_USER     = "root"
-DB_PASSWORD = "root@123"
-DB_NAME     = "ffiec_data"
-DB_TABLE    = "call_reports"
+DB_NAME             = "ffiec_data"
+TABLE_FINANCIALS    = "call_reports_financials"
+TABLE_POR           = "call_reports_por"
+TABLE_LOG           = "migration_log"
 
-CHECKPOINT_FILE = "parsed_folders_local.json"
-
-# Global variables for worker processes
-worker_conn = None
-worker_cursor = None
-
-def init_worker():
-    """Give every CPU core its own dedicated database connection."""
-    global worker_conn, worker_cursor
-    worker_conn = mysql.connector.connect(
-        host=DB_HOST, port=DB_PORT, user=DB_USER, 
-        password=DB_PASSWORD, database=DB_NAME, 
-        autocommit=False # MASSIVE SPEED BOOST
-    )
-    worker_cursor = worker_conn.cursor()
+def get_db_engine(url):
+    """Creates a SQLAlchemy engine with the correct SSL arguments based on the driver."""
+    connect_args = {}
+    if "tidbcloud.com" in url and "pymysql" in url:
+        connect_args = {"ssl": {"fake_config": True}}
+    return create_engine(url, connect_args=connect_args)
 
 def setup_database():
-    """Creates database and main table if they do not exist."""
-    engine = create_engine(f"mysql+mysqlconnector://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}")
-    with engine.begin() as conn:
-        conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}"))
-        
-    engine = create_engine(f"mysql+mysqlconnector://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-    with engine.begin() as conn:
-        create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS {DB_TABLE} (
+    """Creates database tables if they do not exist and fixes schema mismatches."""
+    DB_URL = st.secrets["DB_URL"]
+    # Use our driver-aware helper
+    engine = get_db_engine(DB_URL)
+    
+    # Use execution_options to force AUTOCOMMIT for DDL statements
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        # 1. Financials Table
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_FINANCIALS} (
             id INT AUTO_INCREMENT PRIMARY KEY,
             idrssd INT,
-            bank_name VARCHAR(255),
-            source_folder VARCHAR(50),
+            report_date VARCHAR(50),
             concept_reference VARCHAR(100),
             value TEXT,
             unit_ref VARCHAR(50),
             context_ref VARCHAR(100)
         ) ENGINE=InnoDB;
-        """
-        conn.execute(text(create_table_query))
+        """))
+        
+        # 2. POR Table (Bank Directory)
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_POR} (
+            idrssd INT PRIMARY KEY,
+            bank_name VARCHAR(255)
+        ) ENGINE=InnoDB;
+        """))
+
+        # 3. Migration Log (Completeness Tracker)
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
+            report_date VARCHAR(50) PRIMARY KEY,
+            status VARCHAR(20),
+            records_inserted INT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+        """))
+
+        # Fix legacy POR schema
+        try:
+            conn.execute(text(f"ALTER TABLE {TABLE_POR} DROP COLUMN source_folder;"))
+        except Exception:
+            pass 
+
+        # 4. Add Indexes for performance (Crucial for large datasets)
+        try:
+            conn.execute(text(f"CREATE INDEX idx_report_date ON {TABLE_FINANCIALS}(report_date);"))
+            conn.execute(text(f"CREATE INDEX idx_idrssd ON {TABLE_FINANCIALS}(idrssd);"))
+        except Exception:
+            pass # Indexes already exist
 
 def load_checkpoint():
-    """Loads JSON tracking from the ROOT directory so it isn't deleted by Streamlit temp cleanup."""
-    cwd = os.getcwd() 
-    path = os.path.join(cwd, CHECKPOINT_FILE)
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return json.load(f)
+    """Queries the Migration Log to see which periods are TRULY completed."""
+    try:
+        DB_URL = st.secrets["DB_URL"]
+        engine = get_db_engine(DB_URL)
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SELECT report_date FROM {TABLE_LOG} WHERE status = 'COMPLETED'")).fetchall()
+            parsed_folders = {row[0]: True for row in result}
+            return {"parsed_folders": parsed_folders}
+    except Exception:
+        pass 
     return {"parsed_folders": {}}
 
-def save_checkpoint(data):
-    """Saves JSON tracking to the ROOT directory."""
-    cwd = os.getcwd()
-    path = os.path.join(cwd, CHECKPOINT_FILE)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=4)
+def deduplicate_data():
+    """Removes exact duplicate rows using a high-speed, memory-efficient chunking strategy."""
+    DB_URL = st.secrets["DB_URL"]
+    engine = get_db_engine(DB_URL)
+    total_removed = 0
+    
+    # 1. Get all unique report dates
+    with engine.connect() as outer_conn:
+        dates = outer_conn.execute(text(f"SELECT DISTINCT report_date FROM {TABLE_FINANCIALS}")).fetchall()
+        report_dates = [d[0] for d in dates]
+
+    if not report_dates:
+        yield ("No data found to deduplicate.", 1.0, 0)
+        return
+
+    # 2. Create the Keep-ID table ONCE (outside the loops)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TEMPORARY TABLE temp_keep_ids (id INT PRIMARY KEY);"))
+
+    total_periods = len(report_dates)
+    for period_idx, rd in enumerate(report_dates):
+        # 3. Get RSSDs for this date
+        with engine.connect() as conn:
+            rssd_results = conn.execute(text(f"SELECT DISTINCT idrssd FROM {TABLE_FINANCIALS} WHERE report_date = :rd"), {"rd": rd}).fetchall()
+            rssds = [r[0] for r in rssd_results]
+
+        if not rssds: continue
+
+        chunk_size = 1000 # Larger chunks are okay now because we aren't creating tables
+        total_chunks = (len(rssds) + chunk_size - 1) // chunk_size
+        
+        for chunk_idx, i in enumerate(range(0, len(rssds), chunk_size)):
+            rssd_chunk = rssds[i:i + chunk_size]
+            rssds_str = ",".join(map(str, rssd_chunk))
+            
+            overall_progress = (period_idx / total_periods) + (chunk_idx / total_chunks / total_periods)
+            yield (f"Cleaning {rd}: Batch {chunk_idx+1}/{total_chunks}...", overall_progress, total_removed)
+
+            with engine.begin() as conn:
+                # Targeted insert survivors into the persistent temp table
+                query_insert = text(f"""
+                    INSERT IGNORE INTO temp_keep_ids 
+                    SELECT MIN(id) FROM {TABLE_FINANCIALS} 
+                    WHERE report_date = :rd AND idrssd IN ({rssds_str})
+                    GROUP BY idrssd, concept_reference, context_ref;
+                """)
+                conn.execute(query_insert, {"rd": rd})
+                
+                # Delete duplicates for JUST this batch
+                query_delete = text(f"""
+                    DELETE t1 FROM {TABLE_FINANCIALS} t1
+                    LEFT JOIN temp_keep_ids t2 ON t1.id = t2.id
+                    WHERE t1.report_date = :rd AND t1.idrssd IN ({rssds_str}) AND t2.id IS NULL;
+                """)
+                result = conn.execute(query_delete, {"rd": rd})
+                total_removed += result.rowcount
+                
+    with engine.begin() as conn:
+        conn.execute(text("DROP TEMPORARY TABLE temp_keep_ids;"))
+                
+    yield (f"Success! Removed {total_removed} duplicates.", 1.0, total_removed)
+
+def wipe_period(report_date):
+    """Deletes all financial data and logs for a specific period."""
+    DB_URL = st.secrets["DB_URL"]
+    engine = get_db_engine(DB_URL)
+    with engine.begin() as conn:
+        # 1. Delete Financials
+        conn.execute(text(f"DELETE FROM {TABLE_FINANCIALS} WHERE report_date = :rd"), {"rd": report_date})
+        # 2. Delete Log entry so it can be re-downloaded/parsed
+        conn.execute(text(f"DELETE FROM {TABLE_LOG} WHERE report_date = :rd"), {"rd": report_date})
 
 def get_date_objects(date_str):
-    """Safely extracts and parses the date, returning None if invalid."""
+    """Safely extracts and parses the date."""
     try:
-        # Grabs just the first 10 characters to ensure it only reads MM/DD/YYYY
-        # even if FFIEC adds trailing spaces or hidden characters
         date_part = date_str.strip()[:10]
         return datetime.strptime(date_part, "%m/%d/%Y")
     except ValueError:
         return None
 
-def load_bank_lookup(por_path):
-    """Loads RSSD to Bank Name mapping from the POR metadata file (V4 logic)."""
-    bank_lookup = {}
+def process_por_file(por_path):
+    """Parses the POR text file and returns a list of (idrssd, bank_name) for UPSERT."""
+    records = []
     try:
         with open(por_path, 'r', encoding='utf-8', errors='replace') as f:
             reader = csv.DictReader(f, delimiter='\t')
@@ -102,34 +189,30 @@ def load_bank_lookup(por_path):
                 name = row.get("Financial Institution Name", "").strip()
                 if rssd and name:
                     try:
-                        bank_lookup[int(rssd)] = name
+                        records.append({"idrssd": int(rssd), "bank_name": name})
                     except ValueError:
                         pass
     except Exception:
         pass
-    return bank_lookup
+    return records
 
-def process_file_and_insert(args):
-    """Worker function for parsing XML into a list of tuples (No direct DB push here)."""
-    filepath, bank_lookup, source_folder = args
+def process_xml_worker(args):
+    """Worker function for parsing XML into financial rows."""
+    filepath, report_date = args
     rows = []
-    
     try:
         tree = ET.parse(filepath)
         root = tree.getroot()
         
         idrssd = None
         for elem in root.iter():
-            if elem.tag.endswith('identifier'):
-                if elem.text:
-                    try:
-                        idrssd = int(elem.text)
-                        break
-                    except ValueError:
-                        pass
+            if elem.tag.endswith('identifier') and elem.text:
+                try:
+                    idrssd = int(elem.text)
+                    break
+                except ValueError:
+                    pass
         if not idrssd: return [] 
-
-        bank_name = bank_lookup.get(idrssd, "Unknown")
 
         for child in root:
             if 'contextRef' in child.attrib:
@@ -139,318 +222,140 @@ def process_file_and_insert(args):
                 context_ref = child.attrib.get('contextRef')
 
                 if value is not None:
-                    rows.append((
-                        idrssd, bank_name, source_folder, concept_ref, value, unit_ref, context_ref
-                    ))
+                    rows.append((idrssd, report_date, concept_ref, value, unit_ref, context_ref))
         return rows
     except Exception:
         return []
 
-def run_bulk_parse(download_dir):
-    yield ("Scanning for downloaded ZIP files...", 0.0)
-    
-    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
-    total_zips = len(zip_files)
-    
-    if total_zips == 0:
-        yield ("No ZIP files found to parse.", 1.0)
-        return
-
-    yield ("Verifying database and table structure...", 0.0)
-    setup_database()
-
-    checkpoint = load_checkpoint()
-    cpu_cores = max(1, multiprocessing.cpu_count() - 1)
-
-    # Initialize a global connection for the main process to handle batch pushes
-    DB_URL = st.secrets["DB_URL"]
-    connect_args = {"ssl": {"fake_config": True}} if "tidbcloud.com" in DB_URL else {}
-    engine = create_engine(DB_URL, connect_args=connect_args)
-
-    for zip_idx, zip_path in enumerate(zip_files, start=1):
-        zip_name = os.path.basename(zip_path).replace('.zip', '')
-        base_progress = (zip_idx - 1) / total_zips
-        
-        if zip_name in checkpoint.get("parsed_folders", {}):
-            yield (f"({zip_idx}/{total_zips}) Skipping {zip_name}, already marked as parsed in JSON.", base_progress)
-            continue
-        
-        yield (f"({zip_idx}/{total_zips}) Extracting {zip_name}...", base_progress)
-        
-        extract_to = os.path.join(download_dir, f"temp_{zip_name}")
-        os.makedirs(extract_to, exist_ok=True)
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to)
-            
-        txt_files = glob.glob(os.path.join(extract_to, "**", "*.txt"), recursive=True)
-        por_path = next((p for p in txt_files if "POR" in os.path.basename(p).upper()), None)
-        
-        if not por_path:
-            yield (f"({zip_idx}/{total_zips}) No POR file found in {zip_name}. Skipping.", base_progress)
-            shutil.rmtree(extract_to, ignore_errors=True)
-            continue
-            
-        bank_lookup = load_bank_lookup(por_path)
-        xml_files = sorted(glob.glob(os.path.join(extract_to, "**", "*.xml"), recursive=True))
-        total_xmls = len(xml_files)
-        
-        if total_xmls == 0:
-            shutil.rmtree(extract_to, ignore_errors=True)
-            continue
-            
-        yield (f"({zip_idx}/{total_zips}) Found {total_xmls} XMLs. Parsing in parallel...", base_progress)
-
-        task_args = [(path, bank_lookup, zip_name) for path in xml_files]
-        total_rows_inserted = 0
-        batch_buffer = []
-        BATCH_SIZE = 50000 # Large batch size for TiDB efficiency
-
-        # Use ProcessPool to parse XML (CPU intensive)
-        with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
-            # We use map to get the lists of rows from each XML file
-            for i, file_rows in enumerate(executor.map(process_file_and_insert, task_args, chunksize=50)):
-                batch_buffer.extend(file_rows)
-                
-                # When buffer is full, push to DB in one go
-                if len(batch_buffer) >= BATCH_SIZE:
-                    with engine.begin() as conn:
-                        query = text(f"INSERT INTO {DB_TABLE} (idrssd, bank_name, source_folder, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :bank_name, :source_folder, :concept_reference, :value, :unit_ref, :context_ref)")
-                        # Convert tuples to dicts for SQLAlchemy execute
-                        dict_batch = [
-                            {"idrssd": r[0], "bank_name": r[1], "source_folder": r[2], "concept_reference": r[3], "value": r[4], "unit_ref": r[5], "context_ref": r[6]}
-                            for r in batch_buffer
-                        ]
-                        conn.execute(query, dict_batch)
-                    total_rows_inserted += len(batch_buffer)
-                    batch_buffer = []
-
-                if i % 100 == 0:
-                    xml_progress = (i / total_xmls) * (1 / total_zips)
-                    yield (f"({zip_idx}/{total_zips}) Processed {i}/{total_xmls} files...", base_progress + xml_progress)
-
-        # Final flush for the remaining rows in the buffer
-        if batch_buffer:
-            with engine.begin() as conn:
-                query = text(f"INSERT INTO {DB_TABLE} (idrssd, bank_name, source_folder, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :bank_name, :source_folder, :concept_reference, :value, :unit_ref, :context_ref)")
-                dict_batch = [
-                    {"idrssd": r[0], "bank_name": r[1], "source_folder": r[2], "concept_reference": r[3], "value": r[4], "unit_ref": r[5], "context_ref": r[6]}
-                    for r in batch_buffer
-                ]
-                conn.execute(query, dict_batch)
-            total_rows_inserted += len(batch_buffer)
-
-        if "parsed_folders" not in checkpoint:
-            checkpoint["parsed_folders"] = {}
-        checkpoint["parsed_folders"][zip_name] = {"records": total_rows_inserted, "parsed_at": str(datetime.now())}
-        save_checkpoint(checkpoint)
-
-        shutil.rmtree(extract_to, ignore_errors=True)
-
-    yield ("All files successfully parsed and pushed to Database.", 1.0)
-# ==========================================
-# GENERATOR 1: DOWNLOADER (SMART & RANGE MODES)
-# ==========================================
 def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
-    yield ("Step 1: Configuring visible browser...", 0.0)
-    
+    yield ("Step 1: Configuring Headless Browser...", 0.0)
     chrome_options = Options()
-    # chrome_options.add_argument("--headless=new") # Uncomment to run invisibly once tested!
-    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--headless=new") 
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     
-    prefs = {
-        "download.default_directory": download_dir,
-        "download.prompt_for_download": False,
-        "directory_upgrade": True,
-        "profile.default_content_setting_values.automatic_downloads": 1 
-    }
+    prefs = {"download.default_directory": download_dir}
     chrome_options.add_experimental_option("prefs", prefs)
     
     driver = webdriver.Chrome(options=chrome_options)
     wait = WebDriverWait(driver, 30)
 
     try:
-        yield ("Step 2: Accessing FFIEC Bulk Download Page...", 0.05)
+        yield ("Step 2: Accessing FFIEC...", 0.05)
         driver.get("https://cdr.ffiec.gov/public/pws/downloadbulkdata.aspx")
-        time.sleep(2)
         
-        yield ("Step 3: Selecting 'Call Reports -- Single Period'...", 0.05)
-        try:
-            product_dropdown = wait.until(EC.presence_of_element_located((By.ID, "ListBox1")))
-            Select(product_dropdown).select_by_visible_text("Call Reports -- Single Period")
-        except Exception:
-            product_dropdown = wait.until(EC.presence_of_element_located((By.XPATH, "//select[.//option[contains(text(), 'Call Reports -- Single Period')]]")))
-            Select(product_dropdown).select_by_visible_text("Call Reports -- Single Period")
-            
+        product_dropdown = wait.until(EC.presence_of_element_located((By.ID, "ListBox1")))
+        Select(product_dropdown).select_by_visible_text("Call Reports -- Single Period")
         time.sleep(2) 
         
-        yield ("Step 4: Selecting XBRL to trigger date population...", 0.05)
         xbrl_radio = wait.until(EC.element_to_be_clickable((By.ID, "XBRLRadiobutton")))
         driver.execute_script("arguments[0].click();", xbrl_radio)
         time.sleep(2) 
         
-        yield ("Step 5: Waiting for FFIEC server to populate dates...", 0.05)
         date_dropdown_el = wait.until(EC.presence_of_element_located((By.ID, "DatesDropDownList")))
         wait.until(lambda d: len(Select(date_dropdown_el).options) > 1) 
         
-        date_select = Select(date_dropdown_el)
-        all_options = [opt.text.strip() for opt in date_select.options if opt.text.strip()]
-        
-        # --- NEW SMART LOGIC HERE ---
+        all_options = [opt.text.strip() for opt in Select(date_dropdown_el).options if opt.text.strip()]
         target_dates = []
-        
+
         if mode == "range":
-            yield (f"Step 6: Filtering {len(all_options)} dropdown dates by requested range...", 0.05)
             start_dt = datetime.strptime(start_date_str, "%m/%d/%Y")
             end_dt = datetime.strptime(end_date_str, "%m/%d/%Y")
-            for opt in all_options:
-                opt_dt = get_date_objects(opt)
-                if opt_dt and (start_dt <= opt_dt <= end_dt):
-                    target_dates.append(opt)
-                    
-        elif mode == "smart":
-            yield (f"Step 6: Cross-referencing {len(all_options)} dropdown dates with local database...", 0.05)
-            # Load the tracking JSON file
+            target_dates = [opt for opt in all_options if get_date_objects(opt) and (start_dt <= get_date_objects(opt) <= end_dt)]
+        else:
             checkpoint = load_checkpoint()
             parsed_keys = checkpoint.get("parsed_folders", {}).keys()
-            
-            for opt in all_options:
-                opt_dt = get_date_objects(opt)
-                if not opt_dt:
-                    continue
-                
-                # FFIEC Zips are named using MMDDYYYY (e.g. 12/31/2001 becomes 12312001)
-                date_str_compact = opt_dt.strftime("%m%d%Y")
-                
-                # If this date string is NOT found in any of the previously parsed ZIP file names, we need it!
-                already_parsed = any(date_str_compact in key for key in parsed_keys)
-                if not already_parsed:
-                    target_dates.append(opt)
+            target_dates = [opt for opt in all_options if get_date_objects(opt) and opt not in parsed_keys]
         
-        total_files = len(target_dates)
-        
-        if total_files == 0:
-            yield (f"All caught up! Found 0 new/missing dates to download.", 1.0)
-            time.sleep(3)
+        if not target_dates:
+            yield ("No new data to download.", 1.0)
             return
 
-        yield (f"Step 7: Successfully matched {total_files} files to download. Starting loop...", 0.1)
-
         for idx, target in enumerate(target_dates):
-            current_progress = (idx / total_files) * 0.9 + 0.1
-            yield (f"Requesting download for {target}...", current_progress)
-            
-            date_el = wait.until(EC.presence_of_element_located((By.ID, "DatesDropDownList")))
-            Select(date_el).select_by_visible_text(target)
+            current_progress = (idx / len(target_dates)) * 0.9 + 0.1
+            yield (f"Downloading {target}...", current_progress)
+            Select(driver.find_element(By.ID, "DatesDropDownList")).select_by_visible_text(target)
             time.sleep(1)
-
-            download_btn = wait.until(EC.element_to_be_clickable((By.ID, "Download_0")))
-            driver.execute_script("arguments[0].click();", download_btn)
-            
-            yield (f"Waiting up to 60s for FFIEC server to build ZIP for {target}...", current_progress)
-            
-            timeout = 60
-            elapsed = 0
-            file_started = False
-            
-            while elapsed < timeout:
-                if glob.glob(os.path.join(download_dir, "*.crdownload")) or glob.glob(os.path.join(download_dir, "*.zip")):
-                    file_started = True
-                    break
-                time.sleep(2)
-                elapsed += 2
-                
-            if not file_started:
-                yield (f"WARNING: File {target} never started downloading! Skipping...", current_progress)
-                continue
-            
-            yield (f"File generation complete! Downloading {target} to disk...", current_progress)
+            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "Download_0"))
+            time.sleep(2)
             while glob.glob(os.path.join(download_dir, "*.crdownload")):
                 time.sleep(2)
-                
-        yield ("Step 8: All requested ZIP files downloaded successfully.", 1.0)
-        time.sleep(3)
-        
+        yield ("Downloads complete.", 1.0)
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(error_details) 
-        yield (f"CRITICAL ERROR in Downloader: {str(e)}", 1.0)
-        time.sleep(10) 
+        yield (f"Error: {e}", 1.0)
     finally:
         driver.quit()
 
-# ==========================================
-# GENERATOR 2: PARSER
-# ==========================================
 def run_bulk_parse(download_dir):
-    yield ("Scanning for downloaded ZIP files...", 0.0)
+    yield ("Preparing Database...", 0.0)
+    setup_database()
+    checkpoint = load_checkpoint()
     
     zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
-    total_zips = len(zip_files)
-    
-    if total_zips == 0:
-        yield ("No ZIP files found to parse.", 1.0)
-        return
+    if not zip_files: return
 
-    yield ("Verifying database and table structure...", 0.0)
-    setup_database()
-
-    checkpoint = load_checkpoint()
+    DB_URL = st.secrets["DB_URL"]
+    engine = get_db_engine(DB_URL)
     cpu_cores = max(1, multiprocessing.cpu_count() - 1)
 
-    # Added start=1 so the counter reads (1/5) instead of (0/5)
     for zip_idx, zip_path in enumerate(zip_files, start=1):
-        zip_name = os.path.basename(zip_path).replace('.zip', '')
-        base_progress = (zip_idx - 1) / total_zips
+        base_progress = (zip_idx - 1) / len(zip_files)
+        match = re.search(r'(\d{8})', os.path.basename(zip_path))
+        if not match: continue
+        raw_date = match.group(1)
+        formatted_date = f"{raw_date[0:2]}/{raw_date[2:4]}/{raw_date[4:8]}"
         
-        if zip_name in checkpoint.get("parsed_folders", {}):
-            yield (f"({zip_idx}/{total_zips}) Skipping {zip_name}, already marked as parsed in JSON.", base_progress)
+        if formatted_date in checkpoint.get("parsed_folders", {}):
             continue
         
-        yield (f"({zip_idx}/{total_zips}) Extracting {zip_name}...", base_progress)
+        # Mark as 'STARTED' in log
+        with engine.begin() as conn:
+            conn.execute(text(f"REPLACE INTO {TABLE_LOG} (report_date, status, records_inserted) VALUES (:rd, 'STARTED', 0)"), {"rd": formatted_date})
+
+        yield (f"Processing {formatted_date}...", base_progress)
         
-        extract_to = os.path.join(download_dir, f"temp_{zip_name}")
+        extract_to = os.path.join(download_dir, f"temp_{raw_date}")
         os.makedirs(extract_to, exist_ok=True)
-        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
             
-        txt_files = glob.glob(os.path.join(extract_to, "**", "*.txt"), recursive=True)
-        por_path = next((p for p in txt_files if "POR" in os.path.basename(p).upper()), None)
-        
-        if not por_path:
-            yield (f"({zip_idx}/{total_zips}) No POR file found in {zip_name}. Skipping.", base_progress)
-            shutil.rmtree(extract_to, ignore_errors=True)
-            continue
-            
-        bank_lookup = load_bank_lookup(por_path)
+        por_file = next((p for p in glob.glob(os.path.join(extract_to, "**/*POR*.txt"), recursive=True)), None)
+        if por_file:
+            por_records = process_por_file(por_file)
+            if por_records:
+                with engine.begin() as conn:
+                    conn.execute(text(f"REPLACE INTO {TABLE_POR} (idrssd, bank_name) VALUES (:idrssd, :bank_name)"), por_records)
 
-        xml_files = sorted(glob.glob(os.path.join(extract_to, "**", "*.xml"), recursive=True))
+        xml_files = glob.glob(os.path.join(extract_to, "**/*.xml"), recursive=True)
         total_xmls = len(xml_files)
-        
-        if total_xmls == 0:
-            shutil.rmtree(extract_to, ignore_errors=True)
-            continue
-            
-        yield (f"({zip_idx}/{total_zips}) Found {total_xmls} XMLs. Starting multicore SQL push...", base_progress)
+        task_args = [(path, formatted_date) for path in xml_files]
+        batch_buffer = []
+        BATCH_SIZE = 10000
+        total_rows_inserted = 0
 
-        task_args = [(path, bank_lookup, zip_name) for path in xml_files]
-        total_rows = 0
-        
-        with ProcessPoolExecutor(max_workers=cpu_cores, initializer=init_worker) as executor:
-            for i, rows_inserted in enumerate(executor.map(process_file_and_insert, task_args, chunksize=25)):
-                total_rows += rows_inserted
-                # Updates the frontend every 50 XML files with BOTH the ZIP counter and the XML counter
-                if i % 50 == 0:
-                    xml_progress = (i / total_xmls) * (1 / total_zips)
-                    yield (f"({zip_idx}/{total_zips}) Pushing {zip_name}: XML File {i}/{total_xmls}...", base_progress + xml_progress)
+        with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
+            for i, file_rows in enumerate(executor.map(process_xml_worker, task_args, chunksize=50), start=1):
+                batch_buffer.extend(file_rows)
+                if len(batch_buffer) >= BATCH_SIZE:
+                    with engine.begin() as conn:
+                        sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
+                        conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
+                    total_rows_inserted += len(batch_buffer)
+                    batch_buffer = []
+                
+                if i % 100 == 0:
+                    xml_progress = (i / total_xmls) * (1 / len(zip_files))
+                    yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", (base_progress + xml_progress))
 
-        if "parsed_folders" not in checkpoint:
-            checkpoint["parsed_folders"] = {}
-        checkpoint["parsed_folders"][zip_name] = {"records": total_rows, "parsed_at": str(datetime.now())}
-        save_checkpoint(checkpoint)
+        if batch_buffer:
+            with engine.begin() as conn:
+                sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
+                conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
+            total_rows_inserted += len(batch_buffer)
+
+        # Final Log Update: Mark as 'COMPLETED'
+        with engine.begin() as conn:
+            conn.execute(text(f"UPDATE {TABLE_LOG} SET status = 'COMPLETED', records_inserted = :ri WHERE report_date = :rd"), {"ri": total_rows_inserted, "rd": formatted_date})
 
         shutil.rmtree(extract_to, ignore_errors=True)
-
-    yield ("All files successfully parsed and pushed to Database.", 1.0)
+    yield ("Done!", 1.0)
