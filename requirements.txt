@@ -2,6 +2,7 @@ streamlit
 pandas
 sqlalchemy
 pymysql
+mysql-connector-python
 google-genai
 requests
 h2o
