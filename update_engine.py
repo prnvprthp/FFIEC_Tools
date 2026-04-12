@@ -18,10 +18,19 @@ TABLE_POR           = "call_reports_por"
 TABLE_LOG           = "migration_log"
 
 def get_db_engine(url):
-    """Creates a SQLAlchemy engine with the correct SSL arguments based on the driver."""
+    """Creates a SQLAlchemy engine, forcing pymysql for TiDB Cloud to avoid SSL bugs."""
+    # Force swap mysqlconnector -> pymysql if it's a TiDB Cloud URL
+    if "tidbcloud.com" in url:
+        if "mysqlconnector" in url:
+            url = url.replace("mysqlconnector", "pymysql")
+        elif "mysql://" in url:
+            url = url.replace("mysql://", "mysql+pymysql://")
+            
     connect_args = {}
-    if "tidbcloud.com" in url and "pymysql" in url:
+    if "pymysql" in url:
+        # Pymysql-specific SSL config for TiDB Cloud
         connect_args = {"ssl": {"fake_config": True}}
+        
     return create_engine(url, connect_args=connect_args)
 
 def setup_database():
