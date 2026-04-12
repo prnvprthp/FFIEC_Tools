@@ -12,8 +12,8 @@ st.set_page_config(page_title="Fetch Tool", page_icon="🏦", layout="wide")
 DB_URL = st.secrets["DB_URL"]
 
 # --- FFIEC API Credentials ---
-API_USERNAME = "pprathap"
-API_TOKEN = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJBY2Nlc3MgVG9rZW4iLCJqdGkiOiIxOGI5MTZmYS00Yjk3LTQ1NzEtYmFlMC01ZTFmYjU0MThiN2UiLCJuYmYiOjE3NzUwMDI4NDEsImV4cCI6MTc4Mjc3ODg0MSwiaXNzIjoiMWVmYzAyYmMtMmRkYS00MWM4LWE4ZWItMjMxYTMzNDMzMDkzIiwiYXVkIjoiUFdTIFVzZXIifQ."
+API_USERNAME = st.secrets.get("FFIEC_USERNAME", "pprathap")
+API_TOKEN = st.secrets.get("FFIEC_TOKEN", "")
 
 @st.cache_resource
 def get_db_engine():

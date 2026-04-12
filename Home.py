@@ -4,33 +4,30 @@ import shutil
 import datetime
 import json
 import re
+from sqlalchemy import create_engine, text
 
 # Import the background processing engine
 from update_engine import run_bulk_download, run_bulk_parse
 
 def get_latest_parsed_date():
-    """Reads the JSON tracking file to find the most recently parsed Call Report date."""
+    """Queries the database to find the most recently parsed Call Report date."""
     try:
-        if os.path.exists("parsed_folders_local.json"):
-            with open("parsed_folders_local.json", "r") as f:
-                data = json.load(f)
-            
-            folders = data.get("parsed_folders", {}).keys()
-            max_date = None
-            
-            for folder in folders:
-                # Extract the 8-digit date from the end of the folder name (e.g., "03312001")
-                match = re.search(r'(\d{8})', folder)
+        DB_URL = st.secrets["DB_URL"]
+        engine = create_engine(DB_URL)
+        with engine.connect() as conn:
+            # Query the max report_date from the financials table
+            result = conn.execute(text("SELECT MAX(report_date) FROM call_reports_financials")).scalar()
+            if result:
+                # Handle both string (MMDDYYYY) and date/datetime objects
+                if isinstance(result, (datetime.date, datetime.datetime)):
+                    return result if isinstance(result, datetime.date) else result.date()
+                
+                # If it's a string like '12312023'
+                match = re.search(r'(\d{8})', str(result))
                 if match:
-                    date_str = match.group(1)
-                    folder_date = datetime.datetime.strptime(date_str, "%m%d%Y").date()
-                    if max_date is None or folder_date > max_date:
-                        max_date = folder_date
-                        
-            if max_date:
-                return max_date
+                    return datetime.datetime.strptime(match.group(1), "%m%d%Y").date()
     except Exception:
-        pass # If anything goes wrong, just fall back to today's date
+        pass # Fall back to today's date if DB is empty or unreachable
         
     return datetime.date.today()
 

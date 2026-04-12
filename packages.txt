@@ -1,1 +1,3 @@
 default-jre
+chromium
+chromium-chromedriver

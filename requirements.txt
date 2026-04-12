@@ -2,7 +2,7 @@ streamlit
 pandas
 sqlalchemy
 pymysql
-google-generativeai
+google-genai
 requests
 h2o
 selenium
