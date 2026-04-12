@@ -110,16 +110,14 @@ def load_bank_lookup(por_path):
     return bank_lookup
 
 def process_file_and_insert(args):
-    """Worker function for multiprocessing XML parsing (Namespace Agnostic)."""
+    """Worker function for parsing XML into a list of tuples (No direct DB push here)."""
     filepath, bank_lookup, source_folder = args
-    global worker_conn, worker_cursor
-    rows_to_insert = []
+    rows = []
     
     try:
         tree = ET.parse(filepath)
         root = tree.getroot()
         
-        # 1. Namespace-Agnostic ID finder
         idrssd = None
         for elem in root.iter():
             if elem.tag.endswith('identifier'):
@@ -129,13 +127,10 @@ def process_file_and_insert(args):
                         break
                     except ValueError:
                         pass
-
-        if not idrssd:
-            return 0 
+        if not idrssd: return [] 
 
         bank_name = bank_lookup.get(idrssd, "Unknown")
 
-        # 2. Namespace-Agnostic Concept finder
         for child in root:
             if 'contextRef' in child.attrib:
                 concept_ref = child.tag.split('}')[-1]
@@ -144,24 +139,115 @@ def process_file_and_insert(args):
                 context_ref = child.attrib.get('contextRef')
 
                 if value is not None:
-                    rows_to_insert.append((
+                    rows.append((
                         idrssd, bank_name, source_folder, concept_ref, value, unit_ref, context_ref
                     ))
-
-        if rows_to_insert:
-            query = f"""
-                INSERT INTO {DB_TABLE} 
-                (idrssd, bank_name, source_folder, concept_reference, value, unit_ref, context_ref)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """
-            worker_cursor.executemany(query, rows_to_insert)
-            worker_conn.commit()
-            
-        return len(rows_to_insert)
-
+        return rows
     except Exception:
-        if worker_conn: worker_conn.rollback()
-        return 0
+        return []
+
+def run_bulk_parse(download_dir):
+    yield ("Scanning for downloaded ZIP files...", 0.0)
+    
+    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
+    total_zips = len(zip_files)
+    
+    if total_zips == 0:
+        yield ("No ZIP files found to parse.", 1.0)
+        return
+
+    yield ("Verifying database and table structure...", 0.0)
+    setup_database()
+
+    checkpoint = load_checkpoint()
+    cpu_cores = max(1, multiprocessing.cpu_count() - 1)
+
+    # Initialize a global connection for the main process to handle batch pushes
+    DB_URL = st.secrets["DB_URL"]
+    connect_args = {"ssl": {"fake_config": True}} if "tidbcloud.com" in DB_URL else {}
+    engine = create_engine(DB_URL, connect_args=connect_args)
+
+    for zip_idx, zip_path in enumerate(zip_files, start=1):
+        zip_name = os.path.basename(zip_path).replace('.zip', '')
+        base_progress = (zip_idx - 1) / total_zips
+        
+        if zip_name in checkpoint.get("parsed_folders", {}):
+            yield (f"({zip_idx}/{total_zips}) Skipping {zip_name}, already marked as parsed in JSON.", base_progress)
+            continue
+        
+        yield (f"({zip_idx}/{total_zips}) Extracting {zip_name}...", base_progress)
+        
+        extract_to = os.path.join(download_dir, f"temp_{zip_name}")
+        os.makedirs(extract_to, exist_ok=True)
+        
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+            
+        txt_files = glob.glob(os.path.join(extract_to, "**", "*.txt"), recursive=True)
+        por_path = next((p for p in txt_files if "POR" in os.path.basename(p).upper()), None)
+        
+        if not por_path:
+            yield (f"({zip_idx}/{total_zips}) No POR file found in {zip_name}. Skipping.", base_progress)
+            shutil.rmtree(extract_to, ignore_errors=True)
+            continue
+            
+        bank_lookup = load_bank_lookup(por_path)
+        xml_files = sorted(glob.glob(os.path.join(extract_to, "**", "*.xml"), recursive=True))
+        total_xmls = len(xml_files)
+        
+        if total_xmls == 0:
+            shutil.rmtree(extract_to, ignore_errors=True)
+            continue
+            
+        yield (f"({zip_idx}/{total_zips}) Found {total_xmls} XMLs. Parsing in parallel...", base_progress)
+
+        task_args = [(path, bank_lookup, zip_name) for path in xml_files]
+        total_rows_inserted = 0
+        batch_buffer = []
+        BATCH_SIZE = 50000 # Large batch size for TiDB efficiency
+
+        # Use ProcessPool to parse XML (CPU intensive)
+        with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
+            # We use map to get the lists of rows from each XML file
+            for i, file_rows in enumerate(executor.map(process_file_and_insert, task_args, chunksize=50)):
+                batch_buffer.extend(file_rows)
+                
+                # When buffer is full, push to DB in one go
+                if len(batch_buffer) >= BATCH_SIZE:
+                    with engine.begin() as conn:
+                        query = text(f"INSERT INTO {DB_TABLE} (idrssd, bank_name, source_folder, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :bank_name, :source_folder, :concept_reference, :value, :unit_ref, :context_ref)")
+                        # Convert tuples to dicts for SQLAlchemy execute
+                        dict_batch = [
+                            {"idrssd": r[0], "bank_name": r[1], "source_folder": r[2], "concept_reference": r[3], "value": r[4], "unit_ref": r[5], "context_ref": r[6]}
+                            for r in batch_buffer
+                        ]
+                        conn.execute(query, dict_batch)
+                    total_rows_inserted += len(batch_buffer)
+                    batch_buffer = []
+
+                if i % 100 == 0:
+                    xml_progress = (i / total_xmls) * (1 / total_zips)
+                    yield (f"({zip_idx}/{total_zips}) Processed {i}/{total_xmls} files...", base_progress + xml_progress)
+
+        # Final flush for the remaining rows in the buffer
+        if batch_buffer:
+            with engine.begin() as conn:
+                query = text(f"INSERT INTO {DB_TABLE} (idrssd, bank_name, source_folder, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :bank_name, :source_folder, :concept_reference, :value, :unit_ref, :context_ref)")
+                dict_batch = [
+                    {"idrssd": r[0], "bank_name": r[1], "source_folder": r[2], "concept_reference": r[3], "value": r[4], "unit_ref": r[5], "context_ref": r[6]}
+                    for r in batch_buffer
+                ]
+                conn.execute(query, dict_batch)
+            total_rows_inserted += len(batch_buffer)
+
+        if "parsed_folders" not in checkpoint:
+            checkpoint["parsed_folders"] = {}
+        checkpoint["parsed_folders"][zip_name] = {"records": total_rows_inserted, "parsed_at": str(datetime.now())}
+        save_checkpoint(checkpoint)
+
+        shutil.rmtree(extract_to, ignore_errors=True)
+
+    yield ("All files successfully parsed and pushed to Database.", 1.0)
 # ==========================================
 # GENERATOR 1: DOWNLOADER (SMART & RANGE MODES)
 # ==========================================
