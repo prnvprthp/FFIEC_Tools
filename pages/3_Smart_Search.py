@@ -71,7 +71,7 @@ with st.sidebar:
             st.success("Gemini Key loaded successfully.")
         except:
             api_key = st.text_input("Enter Gemini API Key", type="password")
-        model_choice = st.selectbox("Model:", ["gemini-2.5-flash", "gemini-2.5-pro"])
+        model_choice = st.selectbox("Model:", ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"])
     else:
         if is_ollama_online():
             st.success("Ollama Service: ONLINE")
@@ -173,7 +173,8 @@ with tab1:
                     raw_sql = get_ai_response(get_ai_client(api_key), model_choice, user_query, get_schema_context())
                 else:
                     payload = {"model": model_choice, "prompt": f"{get_schema_context()}\n\nUser Question/Context: {user_query}", "stream": False}
-                    raw_sql = requests.post(ollama_url, json=payload, timeout=180).json().get("response", "")
+                    # Increased timeout to 10 minutes to support slow local hardware
+                    raw_sql = requests.post(ollama_url, json=payload, timeout=600).json().get("response", "")
                 
                 # Clean SQL
                 clean_sql = re.sub(r"```sql\n?|```", "", raw_sql).strip()

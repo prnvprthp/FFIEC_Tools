@@ -11,14 +11,12 @@ import xml.etree.ElementTree as ET
 from sqlalchemy import create_engine, text
 import streamlit as st
 
-# --- Database Configuration ---
 DB_NAME             = "ffiec_data"
 TABLE_FINANCIALS    = "call_reports_financials"
 TABLE_POR           = "call_reports_por"
 TABLE_LOG           = "migration_log"
 
 def get_db_engine(url):
-    """Creates a SQLAlchemy engine, forcing pymysql for TiDB Cloud to avoid SSL bugs."""
     if "tidbcloud.com" in url:
         if "mysqlconnector" in url:
             url = url.replace("mysqlconnector", "pymysql")
@@ -28,81 +26,45 @@ def get_db_engine(url):
     return create_engine(url, connect_args=connect_args)
 
 def setup_database():
-    """Creates database tables if they do not exist and fixes schema mismatches."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_FINANCIALS} (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            idrssd INT,
-            report_date VARCHAR(50),
-            concept_reference VARCHAR(100),
-            value TEXT,
-            unit_ref VARCHAR(50),
-            context_ref VARCHAR(100)
-        ) ENGINE=InnoDB;
-        """))
-        conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_POR} (
-            idrssd INT PRIMARY KEY,
-            bank_name VARCHAR(255)
-        ) ENGINE=InnoDB;
-        """))
-        conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
-            report_date VARCHAR(50) PRIMARY KEY,
-            status VARCHAR(20),
-            records_inserted INT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB;
-        """))
-        try:
-            conn.execute(text(f"ALTER TABLE {TABLE_POR} DROP COLUMN source_folder;"))
-        except Exception:
-            pass 
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS {TABLE_FINANCIALS} (id INT AUTO_INCREMENT PRIMARY KEY, idrssd INT, report_date VARCHAR(50), concept_reference VARCHAR(100), value TEXT, unit_ref VARCHAR(50), context_ref VARCHAR(100)) ENGINE=InnoDB;"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS {TABLE_POR} (idrssd INT PRIMARY KEY, bank_name VARCHAR(255)) ENGINE=InnoDB;"))
+        conn.execute(text(f"CREATE TABLE IF NOT EXISTS {TABLE_LOG} (report_date VARCHAR(50) PRIMARY KEY, status VARCHAR(20), records_inserted INT, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB;"))
+        try: conn.execute(text(f"ALTER TABLE {TABLE_POR} DROP COLUMN source_folder;"))
+        except Exception: pass 
         try:
             conn.execute(text(f"CREATE INDEX idx_report_date ON {TABLE_FINANCIALS}(report_date);"))
             conn.execute(text(f"CREATE INDEX idx_idrssd ON {TABLE_FINANCIALS}(idrssd);"))
-        except Exception:
-            pass 
+        except Exception: pass 
 
 def load_checkpoint():
-    """Queries the Migration Log to see which periods are TRULY completed."""
     try:
         DB_URL = st.secrets["DB_URL"]
         engine = get_db_engine(DB_URL)
         with engine.connect() as conn:
             result = conn.execute(text(f"SELECT report_date FROM {TABLE_LOG} WHERE status = 'COMPLETED'")).fetchall()
-            parsed_folders = {row[0]: True for row in result}
-            return {"parsed_folders": parsed_folders}
-    except Exception:
-        pass 
+            return {"parsed_folders": {row[0]: True for row in result}}
+    except Exception: pass 
     return {"parsed_folders": {}}
 
 def deduplicate_data():
-    """Removes exact duplicate rows using a high-speed, memory-efficient chunking strategy."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     total_removed = 0
-    
     with engine.connect() as outer_conn:
         dates = outer_conn.execute(text(f"SELECT DISTINCT report_date FROM {TABLE_FINANCIALS}")).fetchall()
         report_dates = [d[0] for d in dates]
-
     if not report_dates:
-        yield ("No data found to deduplicate.", 1.0, 0)
-        return
-
+        yield ("No data found to deduplicate.", 1.0, 0); return
     with engine.begin() as conn:
         conn.execute(text("CREATE TEMPORARY TABLE temp_keep_ids (id INT PRIMARY KEY);"))
-
     total_periods = len(report_dates)
     for period_idx, rd in enumerate(report_dates):
         with engine.connect() as conn:
             rssd_results = conn.execute(text(f"SELECT DISTINCT idrssd FROM {TABLE_FINANCIALS} WHERE report_date = :rd"), {"rd": rd}).fetchall()
             rssds = [r[0] for r in rssd_results]
-
         if not rssds: continue
         chunk_size = 1000 
         total_chunks = (len(rssds) + chunk_size - 1) // chunk_size
@@ -122,7 +84,6 @@ def deduplicate_data():
     yield (f"Success! Removed {total_removed} duplicates.", 1.0, total_removed)
 
 def wipe_period(report_date):
-    """Deletes all financial data and logs for a specific period."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.begin() as conn:
@@ -160,22 +121,17 @@ def run_bulk_parse(download_dir):
                         with engine.begin() as conn:
                             conn.execute(text(f"REPLACE INTO {TABLE_POR} (idrssd, bank_name) VALUES (:idrssd, :bank_name)"), por_records)
             xml_files = [f for f in all_files if f.endswith(".xml")]
-            total_xmls = len(xml_files)
-            def read_xml_from_zip(filename):
-                with zipfile.ZipFile(zip_path, 'r') as z_inner:
-                    with z_inner.open(filename) as f:
-                        return process_xml_worker_by_content(f.read(), formatted_date)
-            batch_buffer = []; BATCH_SIZE = 10000; total_rows_inserted = 0
-            for i, file_rows in enumerate(map(read_xml_from_zip, xml_files), start=1):
-                batch_buffer.extend(file_rows)
+            total_xmls = len(xml_files); batch_buffer = []; BATCH_SIZE = 10000; total_rows_inserted = 0
+            for i, xml_file in enumerate(xml_files, start=1):
+                with z.open(xml_file) as f:
+                    batch_buffer.extend(process_xml_worker_by_content(f.read(), formatted_date))
                 if len(batch_buffer) >= BATCH_SIZE:
                     with engine.begin() as conn:
                         sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
                         conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
                     total_rows_inserted += len(batch_buffer); batch_buffer = []
                 if i % 100 == 0:
-                    xml_progress = (i / total_xmls) * (1 / len(zip_files))
-                    yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", (base_progress + xml_progress))
+                    yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", base_progress + (i / total_xmls) / len(zip_files))
             if batch_buffer:
                 with engine.begin() as conn:
                     sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
