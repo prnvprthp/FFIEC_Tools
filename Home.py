@@ -127,6 +127,7 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
             
         # --- PHASE 2: PARSING & SQL PUSH ---
         status_text.info("Downloads complete. Starting XML parsing and SQL insertion...")
+        # Note: run_bulk_parse only yields 2 values, whereas deduplicate_data yields 3
         for status_msg, progress_pct in run_bulk_parse(TEMP_DIR):
             status_text.text(f"Parsing: {status_msg}")
             progress_bar.progress(0.5 + (progress_pct * 0.5))
@@ -137,7 +138,7 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
         st.balloons()
 
     except Exception as e:
-        status_text.error(f"❌ Process Failed: {e}")
+        status_text.error(f"Process Failed: {e}")
         st.exception(e)
 
     finally:
@@ -162,14 +163,14 @@ st.markdown("---")
 # ==========================================
 # TOOL 4: DATABASE MAINTENANCE
 # ==========================================
-st.subheader("🛠️ Database Maintenance")
+st.subheader("Database Maintenance")
 st.write("Manage database health, deduplicate records, or reset specific periods.")
 
 with st.expander("Show Maintenance Tools"):
     m_col1, m_col2 = st.columns(2)
 
     with m_col1:
-        st.markdown("### 🧹 Clean Data")
+        st.markdown("### Clean Data")
         st.write("Remove exact duplicate records from the financials table to ensure data integrity.")
         st.markdown("<div style='height: 45px;'></div>", unsafe_allow_html=True)
 
@@ -185,11 +186,11 @@ with st.expander("Show Maintenance Tools"):
                 st.error(f"Deduplication failed: {e}")
 
     with m_col2:
-        st.markdown("### 🔄 Reset Data")
+        st.markdown("### Reset Data")
         st.write("Wipe all data for a specific period. Use this if a download was corrupted or partial.")
 
         date_options = []
-        with st.spinner("🔍 Checking database for available periods..."):
+        with st.spinner("Checking database for available periods..."):
             try:
                 setup_database()
                 
@@ -215,7 +216,7 @@ with st.expander("Show Maintenance Tools"):
         selected_wipe = st.selectbox("Select Period", options=date_options if date_options else ["No data found"])
         
         if not date_options:
-            st.info("💡 No report dates found in the database. Run a download first!")
+            st.info("No report dates found in the database. Run a download first!")
 
         if st.button("Wipe Selected Period", type="secondary", use_container_width=True, disabled=not date_options):
             if selected_wipe and selected_wipe != "No data found":

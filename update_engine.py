@@ -18,22 +18,19 @@ TABLE_POR           = "call_reports_por"
 TABLE_LOG           = "migration_log"
 
 def get_db_engine(url):
+    """Creates a SQLAlchemy engine, forcing pymysql for TiDB Cloud to avoid SSL bugs."""
     if "tidbcloud.com" in url:
         if "mysqlconnector" in url:
             url = url.replace("mysqlconnector", "pymysql")
         elif "mysql://" in url:
             url = url.replace("mysql://", "mysql+pymysql://")
-            
-    connect_args = {}
-    if "pymysql" in url:
-        connect_args = {"ssl": {"fake_config": True}}
-        
+    connect_args = {"ssl": {"fake_config": True}} if "pymysql" in url else {}
     return create_engine(url, connect_args=connect_args)
 
 def setup_database():
+    """Creates database tables if they do not exist and fixes schema mismatches."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
-    
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_FINANCIALS} (
@@ -46,14 +43,12 @@ def setup_database():
             context_ref VARCHAR(100)
         ) ENGINE=InnoDB;
         """))
-        
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_POR} (
             idrssd INT PRIMARY KEY,
             bank_name VARCHAR(255)
         ) ENGINE=InnoDB;
         """))
-
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
             report_date VARCHAR(50) PRIMARY KEY,
@@ -62,12 +57,10 @@ def setup_database():
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB;
         """))
-
         try:
             conn.execute(text(f"ALTER TABLE {TABLE_POR} DROP COLUMN source_folder;"))
         except Exception:
             pass 
-
         try:
             conn.execute(text(f"CREATE INDEX idx_report_date ON {TABLE_FINANCIALS}(report_date);"))
             conn.execute(text(f"CREATE INDEX idx_idrssd ON {TABLE_FINANCIALS}(idrssd);"))
@@ -75,6 +68,7 @@ def setup_database():
             pass 
 
 def load_checkpoint():
+    """Queries the Migration Log to see which periods are TRULY completed."""
     try:
         DB_URL = st.secrets["DB_URL"]
         engine = get_db_engine(DB_URL)
@@ -87,6 +81,7 @@ def load_checkpoint():
     return {"parsed_folders": {}}
 
 def deduplicate_data():
+    """Removes exact duplicate rows using a high-speed, memory-efficient chunking strategy."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     total_removed = 0
@@ -127,55 +122,87 @@ def deduplicate_data():
     yield (f"Success! Removed {total_removed} duplicates.", 1.0, total_removed)
 
 def wipe_period(report_date):
+    """Deletes all financial data and logs for a specific period."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.begin() as conn:
         conn.execute(text(f"DELETE FROM {TABLE_FINANCIALS} WHERE report_date = :rd"), {"rd": report_date})
         conn.execute(text(f"DELETE FROM {TABLE_LOG} WHERE report_date = :rd"), {"rd": report_date})
 
-def get_date_objects(date_str):
-    try:
-        date_part = date_str.strip()[:10]
-        return datetime.strptime(date_part, "%m/%d/%Y")
-    except ValueError:
-        return None
+def run_bulk_parse(download_dir):
+    yield ("Preparing Database...", 0.0)
+    setup_database()
+    checkpoint = load_checkpoint()
+    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
+    if not zip_files: return
+    DB_URL = st.secrets["DB_URL"]
+    engine = get_db_engine(DB_URL)
+    for zip_idx, zip_path in enumerate(zip_files, start=1):
+        base_progress = (zip_idx - 1) / len(zip_files)
+        match = re.search(r'(\d{8})', os.path.basename(zip_path))
+        if not match: continue
+        raw_date = match.group(1)
+        formatted_date = f"{raw_date[0:2]}/{raw_date[2:4]}/{raw_date[4:8]}"
+        if formatted_date in checkpoint.get("parsed_folders", {}): continue
+        with engine.begin() as conn:
+            conn.execute(text(f"REPLACE INTO {TABLE_LOG} (report_date, status, records_inserted) VALUES (:rd, 'STARTED', 0)"), {"rd": formatted_date})
+        yield (f"Processing {formatted_date}...", base_progress)
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            all_files = z.namelist()
+            por_filename = next((f for f in all_files if "POR" in f.upper() and f.endswith(".txt")), None)
+            if por_filename:
+                with z.open(por_filename) as f:
+                    content = f.read().decode('utf-8', errors='replace')
+                    reader = csv.DictReader(content.splitlines(), delimiter='\t')
+                    por_records = [{"idrssd": int(row["IDRSSD"]), "bank_name": row["Financial Institution Name"]} 
+                                   for row in reader if row.get("IDRSSD") and row.get("Financial Institution Name")]
+                    if por_records:
+                        with engine.begin() as conn:
+                            conn.execute(text(f"REPLACE INTO {TABLE_POR} (idrssd, bank_name) VALUES (:idrssd, :bank_name)"), por_records)
+            xml_files = [f for f in all_files if f.endswith(".xml")]
+            total_xmls = len(xml_files)
+            def read_xml_from_zip(filename):
+                with zipfile.ZipFile(zip_path, 'r') as z_inner:
+                    with z_inner.open(filename) as f:
+                        return process_xml_worker_by_content(f.read(), formatted_date)
+            batch_buffer = []; BATCH_SIZE = 10000; total_rows_inserted = 0
+            for i, file_rows in enumerate(map(read_xml_from_zip, xml_files), start=1):
+                batch_buffer.extend(file_rows)
+                if len(batch_buffer) >= BATCH_SIZE:
+                    with engine.begin() as conn:
+                        sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
+                        conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
+                    total_rows_inserted += len(batch_buffer); batch_buffer = []
+                if i % 100 == 0:
+                    xml_progress = (i / total_xmls) * (1 / len(zip_files))
+                    yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", (base_progress + xml_progress))
+            if batch_buffer:
+                with engine.begin() as conn:
+                    sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
+                    conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
+                total_rows_inserted += len(batch_buffer)
+        with engine.begin() as conn:
+            conn.execute(text(f"UPDATE {TABLE_LOG} SET status = 'COMPLETED', records_inserted = :ri WHERE report_date = :rd"), {"ri": total_rows_inserted, "rd": formatted_date})
+    yield ("Done!", 1.0)
 
-def process_por_file(por_path):
-    records = []
-    try:
-        with open(por_path, 'r', encoding='utf-8', errors='replace') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                rssd = row.get("IDRSSD", "").strip()
-                name = row.get("Financial Institution Name", "").strip()
-                if rssd and name:
-                    try: records.append({"idrssd": int(rssd), "bank_name": name})
-                    except ValueError: pass
-    except Exception: pass
-    return records
-
-def process_xml_worker(args):
-    filepath, report_date = args
+def process_xml_worker_by_content(xml_content, report_date):
     rows = []
     try:
-        tree = ET.parse(filepath)
-        root = tree.getroot()
+        root = ET.fromstring(xml_content)
         idrssd = None
         for elem in root.iter():
             if elem.tag.endswith('identifier') and elem.text:
                 try: idrssd = int(elem.text); break
-                except ValueError: pass
+                except: pass
         if not idrssd: return [] 
         for child in root:
             if 'contextRef' in child.attrib:
                 concept_ref = child.tag.split('}')[-1]
                 value = child.text.strip() if child.text else None
-                unit_ref = child.attrib.get('unitRef')
-                context_ref = child.attrib.get('contextRef')
                 if value is not None:
-                    rows.append((idrssd, report_date, concept_ref, value, unit_ref, context_ref))
+                    rows.append((idrssd, report_date, concept_ref, value, child.attrib.get('unitRef'), child.attrib.get('contextRef')))
         return rows
-    except Exception: return []
+    except: return []
 
 def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
     from selenium import webdriver
@@ -183,7 +210,6 @@ def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select, WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-
     yield ("Step 1: Configuring Headless Browser...", 0.0)
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -227,58 +253,3 @@ def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
         yield ("Downloads complete.", 1.0)
     except Exception as e: yield (f"Error: {e}", 1.0)
     finally: driver.quit()
-
-def run_bulk_parse(download_dir):
-    from concurrent.futures import ProcessPoolExecutor
-    import multiprocessing
-
-    yield ("Preparing Database...", 0.0)
-    setup_database()
-    checkpoint = load_checkpoint()
-    zip_files = sorted(glob.glob(os.path.join(download_dir, "*.zip")))
-    if not zip_files: return
-    DB_URL = st.secrets["DB_URL"]
-    engine = get_db_engine(DB_URL)
-    cpu_cores = max(1, multiprocessing.cpu_count() - 1)
-    for zip_idx, zip_path in enumerate(zip_files, start=1):
-        base_progress = (zip_idx - 1) / len(zip_files)
-        match = re.search(r'(\d{8})', os.path.basename(zip_path))
-        if not match: continue
-        raw_date = match.group(1)
-        formatted_date = f"{raw_date[0:2]}/{raw_date[2:4]}/{raw_date[4:8]}"
-        if formatted_date in checkpoint.get("parsed_folders", {}): continue
-        with engine.begin() as conn:
-            conn.execute(text(f"REPLACE INTO {TABLE_LOG} (report_date, status, records_inserted) VALUES (:rd, 'STARTED', 0)"), {"rd": formatted_date})
-        yield (f"Processing {formatted_date}...", base_progress)
-        extract_to = os.path.join(download_dir, f"temp_{raw_date}")
-        os.makedirs(extract_to, exist_ok=True)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(extract_to)
-        por_file = next((p for p in glob.glob(os.path.join(extract_to, "**/*POR*.txt"), recursive=True)), None)
-        if por_file:
-            por_records = process_por_file(por_file)
-            if por_records:
-                with engine.begin() as conn:
-                    conn.execute(text(f"REPLACE INTO {TABLE_POR} (idrssd, bank_name) VALUES (:idrssd, :bank_name)"), por_records)
-        xml_files = glob.glob(os.path.join(extract_to, "**/*.xml"), recursive=True)
-        total_xmls = len(xml_files); task_args = [(path, formatted_date) for path in xml_files]
-        batch_buffer = []; BATCH_SIZE = 10000; total_rows_inserted = 0
-        with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
-            for i, file_rows in enumerate(executor.map(process_xml_worker, task_args, chunksize=50), start=1):
-                batch_buffer.extend(file_rows)
-                if len(batch_buffer) >= BATCH_SIZE:
-                    with engine.begin() as conn:
-                        sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
-                        conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
-                    total_rows_inserted += len(batch_buffer); batch_buffer = []
-                if i % 100 == 0:
-                    xml_progress = (i / total_xmls) * (1 / len(zip_files))
-                    yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", (base_progress + xml_progress))
-        if batch_buffer:
-            with engine.begin() as conn:
-                sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
-                conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
-            total_rows_inserted += len(batch_buffer)
-        with engine.begin() as conn:
-            conn.execute(text(f"UPDATE {TABLE_LOG} SET status = 'COMPLETED', records_inserted = :ri WHERE report_date = :rd"), {"ri": total_rows_inserted, "rd": formatted_date})
-        shutil.rmtree(extract_to, ignore_errors=True)
-    yield ("Done!", 1.0)

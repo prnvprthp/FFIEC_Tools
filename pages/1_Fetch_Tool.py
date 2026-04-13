@@ -224,7 +224,7 @@ try:
                         st.success(f"Successfully retrieved and merged records for {len(selected_rssds)} bank(s) across {len(selected_periods)} period(s).")
                         
                         # --- RENDER PDF TABS ---
-                        st.markdown("### 📄 Official PDF Reports")
+                        st.markdown("### Official PDF Reports")
                         tabs = st.tabs([f"{rssd_to_name[rssd]} ({rssd})" for rssd in selected_rssds])
                         
                         for i, rssd in enumerate(selected_rssds):
@@ -232,7 +232,7 @@ try:
                                 for period in selected_periods:
                                     formatted_date = format_date_label(period)
                                     
-                                    with st.expander(f"📁 View Report for {formatted_date}"):
+                                    with st.expander(f"View Report for {formatted_date}"):
                                         pdf_bytes, api_error = fetch_pdf_from_api(rssd, formatted_date)
                                         
                                         if pdf_bytes:
@@ -244,7 +244,7 @@ try:
                                             
                                             with col1:
                                                 st.download_button(
-                                                    label="⬇️ Download PDF", 
+                                                    label="Download PDF", 
                                                     data=pdf_bytes,
                                                     file_name=f"Call_Report_{rssd}_{formatted_date.replace('/', '-')}.pdf",
                                                     mime="application/pdf",
@@ -253,7 +253,7 @@ try:
                                                     key=f"dl_{rssd}_{period}" 
                                                 )
                                             with col2:
-                                                if st.button("👁️ Toggle Viewer", use_container_width=True, type="secondary", key=f"tg_{rssd}_{period}"):
+                                                if st.button("Toggle Viewer", use_container_width=True, type="secondary", key=f"tg_{rssd}_{period}"):
                                                     st.session_state[pdf_state_key] = not st.session_state[pdf_state_key]
                                             
                                             if st.session_state[pdf_state_key]:
@@ -261,7 +261,7 @@ try:
                                                 pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500px" type="application/pdf" style="border: 1px solid #E0E0E0; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 5px; margin-top: 10px;"></iframe>'
                                                 st.markdown(pdf_display, unsafe_allow_html=True)
                                         else:
-                                            st.warning(f"🚫 **Not Available:** The official PDF for **{rssd_to_name[rssd]}** ({formatted_date}) has not been published.")
+                                            st.warning(f"**Not Available:** The official PDF for **{rssd_to_name[rssd]}** ({formatted_date}) has not been published.")
                                             
                                             if api_error and "not found" not in api_error.lower():
                                                 st.error(f"🔧 Technical Details: {api_error}")

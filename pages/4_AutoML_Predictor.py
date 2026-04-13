@@ -83,7 +83,7 @@ def fetch_and_pivot_data(selected_idrssds, selected_periods):
     return pivot_df
 
 # --- UI Setup ---
-st.title("🧠 Predictive Analytics (AutoML)")
+st.title("Predictive Analytics (AutoML)")
 st.write("Filter a specific dataset, define your target variable, and let H2O.ai find the best machine learning model.")
 
 # --- Step 1: Dataset Slicer ---
@@ -154,7 +154,7 @@ if 'ml_data' in st.session_state:
     st.dataframe(df_ml.head(), use_container_width=True)
     
     # --- Step 3: Execution ---
-    if st.button("🚀 Train Models with H2O.ai", use_container_width=True):
+    if st.button("Train Models with H2O.ai", use_container_width=True):
         st.markdown("---")
         st.markdown("### 3. Model Leaderboard")
         
