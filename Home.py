@@ -137,12 +137,15 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
         st.balloons()
 
     except Exception as e:
-        status_text.error(f"Process Failed: {e}")
+        status_text.error(f"❌ Process Failed: {e}")
         st.exception(e)
 
     finally:
+        # Cleanup
+        status_text.write("Cleaning up temporary files...")
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        status_text.write("Cleanup complete. Ready for next task.")
 st.markdown("---")
 
 
