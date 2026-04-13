@@ -9,7 +9,6 @@ import time
 st.set_page_config(page_title="AutoML Predictor", page_icon="🧠", layout="wide")
 
 DB_URL = st.secrets["DB_URL"]
-# Ensure we point to the correct schema
 if "/test" in DB_URL:
     DB_URL = DB_URL.replace("/test", "/ffiec_data")
 
@@ -28,7 +27,6 @@ except Exception as e:
 
 # --- Helper Functions ---
 def format_period(period_str):
-    """Converts FFIEC date format (e.g., '12312023') to '2023 Q4' for UI display."""
     period_str = str(period_str)
     if len(period_str) != 8:
         return period_str
@@ -39,9 +37,7 @@ def format_period(period_str):
 
 @st.cache_data
 def get_mdrm_mapping():
-    """Loads the mdrm_dictionary table to map MDRM tags to human-readable names."""
     try:
-        # Pulling from the new mdrm_dictionary table instead of a CSV if possible
         with engine.connect() as conn:
             df = pd.read_sql(text("SELECT concept_reference, item_name FROM mdrm_dictionary"), conn)
         df['formatted_name'] = df['item_name'] + " (" + df['concept_reference'] + ")"
@@ -53,9 +49,7 @@ def get_mdrm_mapping():
 @st.cache_data(ttl=3600)
 def get_filter_options():
     with engine.connect() as conn:
-        # Corrected table: call_reports_por contains the bank names
         banks_df = pd.read_sql(text("SELECT DISTINCT idrssd, bank_name FROM call_reports_por ORDER BY bank_name"), conn)
-        # Corrected table/column: call_reports_financials and report_date
         periods_df = pd.read_sql(text("SELECT DISTINCT report_date FROM call_reports_financials ORDER BY report_date DESC"), conn)
     return banks_df, periods_df['report_date'].tolist()
 
@@ -64,7 +58,6 @@ def fetch_and_pivot_data(selected_idrssds, selected_periods):
     idrssd_list = ",".join([str(i) for i in selected_idrssds])
     period_list = ",".join([f"'{p}'" for p in selected_periods])
     
-    # Corrected schema: call_reports_financials table and report_date column
     query = f"""
         SELECT idrssd, report_date, concept_reference, value 
         FROM call_reports_financials 

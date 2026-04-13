@@ -32,7 +32,6 @@ except Exception as e:
 @st.cache_data(ttl=3600)
 def fetch_all_banks():
     with engine.connect() as conn:
-        # PULL FROM NEW POR TABLE
         query = text("""
             SELECT DISTINCT idrssd, bank_name 
             FROM call_reports_por 
@@ -43,14 +42,12 @@ def fetch_all_banks():
 
 @st.cache_data(ttl=3600)
 def fetch_periods_for_banks(rssd_list):
-    """Fetches periods available for the selected banks."""
     if not rssd_list:
         return pd.DataFrame()
     
     rssd_str = ",".join(map(str, rssd_list))
     
     with engine.connect() as conn:
-        # USE NEW TABLE AND REPORT_DATE
         query = text(f"""
             SELECT DISTINCT report_date AS source_folder
             FROM call_reports_financials 
@@ -61,15 +58,20 @@ def fetch_periods_for_banks(rssd_list):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_pdf_from_api(rssd, date_str):
-    """Fetches the official Call Report PDF from the FFIEC Azure API."""
     api_url = "https://ffieccdr.azure-api.us/public/RetrieveFacsimile"
     
+    try:
+        date_obj = datetime.strptime(date_str, '%m/%d/%Y')
+        iso_date = date_obj.strftime('%Y-%m-%d')
+    except Exception:
+        iso_date = date_str
+
     headers = {
         "UserID": API_USERNAME,
         "Authentication": f"Bearer {API_TOKEN}",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "dataSeries": "Call",
-        "reportingPeriodEndDate": date_str,
+        "reportingPeriodEndDate": iso_date,
         "fiIdType": "ID_RSSD",
         "fiId": str(rssd),
         "facsimileFormat": "PDF"
@@ -158,16 +160,13 @@ try:
 
             # --- STEP 3: Data Fetching ---
             if selected_periods:
-                # Sort periods chronologically
                 selected_periods.sort()
                 
-                # Setup session state to remember the button click
                 if "fetch_clicked" not in st.session_state:
                     st.session_state.fetch_clicked = False
                 if "last_selection" not in st.session_state:
                     st.session_state.last_selection = None
                 
-                # Reset the view if the user changes their bank or date selection
                 current_selection = f"{','.join(map(str, selected_rssds))}_{','.join(selected_periods)}"
                 if st.session_state.last_selection != current_selection:
                     st.session_state.fetch_clicked = False
@@ -184,7 +183,6 @@ try:
                             rssd_str = ",".join(map(str, selected_rssds))
                             periods_str = ",".join([f"'{p}'" for p in selected_periods])
                             
-                            # UPDATED FOR NEW SCHEMA
                             data_query = text(f"""
                                 SELECT 
                                     f.idrssd AS "RSSD",
@@ -203,10 +201,8 @@ try:
                             report_data = pd.read_sql(data_query, conn)
                     
                     if not report_data.empty:
-                        # Format values before pivoting
                         report_data['Value'] = report_data.apply(format_value_column, axis=1)
                         
-                        # Combine Value and Context into a single HTML string with the tooltip
                         def create_display_cell(row):
                             val = str(row['Value']) if pd.notna(row['Value']) else ""
                             if not val or val == "nan":
@@ -215,11 +211,8 @@ try:
                             return f"<span class='tooltip-trigger'>{val}<span class='tooltiptext'><b>Context:</b><br>{context}</span></span>"
                             
                         report_data['Display_Cell'] = report_data.apply(create_display_cell, axis=1)
-                        
-                        # Create a unique column identifier combining RSSD and Period
                         report_data['Col_Key'] = report_data['RSSD'].astype(str) + "_" + report_data['Period'].astype(str)
                         
-                        # PIVOT THE DATA using the composite key
                         pivot_df = pd.pivot_table(
                             report_data,
                             index=['Field ID', 'Definition'], 
@@ -236,7 +229,6 @@ try:
                         
                         for i, rssd in enumerate(selected_rssds):
                             with tabs[i]:
-                                # Loop through periods to create collapsible sections for each PDF
                                 for period in selected_periods:
                                     formatted_date = format_date_label(period)
                                     
@@ -362,10 +354,8 @@ try:
                         
                         table_html = "<div class='table-container'><table class='custom-table'>"
                         
-                        # Build Headers (Period First, then Bank)
                         table_html += "<thead><tr><th style='width: 15%;'>Field ID</th><th style='width: 35%;'>Definition</th>"
                         
-                        # Pre-calculate column keys and colors for ultra-fast row iteration
                         col_props = [] 
                         
                         for period in selected_periods:
@@ -380,7 +370,6 @@ try:
                         
                         table_html += "</tr></thead><tbody>"
                         
-                        # FAST ROW RENDER: Convert to list of dicts instead of using .iterrows
                         records = pivot_df.to_dict('records')
                         html_rows = []
                         
@@ -402,7 +391,6 @@ try:
                             
                         table_html += "".join(html_rows) + "</tbody></table></div>"
                         
-                        # Render the table as an iframe component to prevent Streamlit layout lag
                         st.components.v1.html(css + table_html, height=1000, scrolling=True)
 
                     else:

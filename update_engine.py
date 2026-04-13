@@ -18,8 +18,6 @@ TABLE_POR           = "call_reports_por"
 TABLE_LOG           = "migration_log"
 
 def get_db_engine(url):
-    """Creates a SQLAlchemy engine, forcing pymysql for TiDB Cloud to avoid SSL bugs."""
-    # Force swap mysqlconnector -> pymysql if it's a TiDB Cloud URL
     if "tidbcloud.com" in url:
         if "mysqlconnector" in url:
             url = url.replace("mysqlconnector", "pymysql")
@@ -28,18 +26,15 @@ def get_db_engine(url):
             
     connect_args = {}
     if "pymysql" in url:
-        # Pymysql-specific SSL config for TiDB Cloud
         connect_args = {"ssl": {"fake_config": True}}
         
     return create_engine(url, connect_args=connect_args)
 
 def setup_database():
-    """Creates database tables if they do not exist and fixes schema mismatches."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        # 1. Financials Table
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_FINANCIALS} (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -52,7 +47,6 @@ def setup_database():
         ) ENGINE=InnoDB;
         """))
         
-        # 2. POR Table (Bank Directory)
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_POR} (
             idrssd INT PRIMARY KEY,
@@ -60,7 +54,6 @@ def setup_database():
         ) ENGINE=InnoDB;
         """))
 
-        # 3. Migration Log (Completeness Tracker)
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
             report_date VARCHAR(50) PRIMARY KEY,
@@ -70,13 +63,11 @@ def setup_database():
         ) ENGINE=InnoDB;
         """))
 
-        # Fix legacy POR schema
         try:
             conn.execute(text(f"ALTER TABLE {TABLE_POR} DROP COLUMN source_folder;"))
         except Exception:
             pass 
 
-        # 4. Add Indexes for performance
         try:
             conn.execute(text(f"CREATE INDEX idx_report_date ON {TABLE_FINANCIALS}(report_date);"))
             conn.execute(text(f"CREATE INDEX idx_idrssd ON {TABLE_FINANCIALS}(idrssd);"))
@@ -84,7 +75,6 @@ def setup_database():
             pass 
 
 def load_checkpoint():
-    """Queries the Migration Log to see which periods are TRULY completed."""
     try:
         DB_URL = st.secrets["DB_URL"]
         engine = get_db_engine(DB_URL)
@@ -97,7 +87,6 @@ def load_checkpoint():
     return {"parsed_folders": {}}
 
 def deduplicate_data():
-    """Removes exact duplicate rows using a high-speed, memory-efficient chunking strategy."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     total_removed = 0
@@ -138,7 +127,6 @@ def deduplicate_data():
     yield (f"Success! Removed {total_removed} duplicates.", 1.0, total_removed)
 
 def wipe_period(report_date):
-    """Deletes all financial data and logs for a specific period."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.begin() as conn:

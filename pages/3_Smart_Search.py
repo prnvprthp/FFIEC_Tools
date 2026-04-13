@@ -10,7 +10,6 @@ import socket
 # --- UI Setup ---
 st.set_page_config(page_title="Smart-Search (beta)", layout="wide")
 
-# Custom CSS for UI Polish (Minimalist Corporate Theme)
 st.markdown("""
     <style>
     .stTextArea textarea {
@@ -44,7 +43,6 @@ st.markdown("<hr style='border: 1px solid #eaeaea; margin-top: 0;'>", unsafe_all
 
 # --- Database Connection ---
 DB_URL = st.secrets["DB_URL"]
-# Ensure we are hitting the correct schema
 if "/test" in DB_URL:
     DB_URL = DB_URL.replace("/test", "/ffiec_data")
 
@@ -164,7 +162,6 @@ with tab1:
             start_t = time.time()
 
             try:
-                # 1. GENERATE SQL
                 status_text.info("Generating SQL...")
                 progress_bar.progress(25)
                 
@@ -174,7 +171,6 @@ with tab1:
                     _url=(ollama_url if search_engine == "Ollama (Local)" else None)
                 )
                 
-                # Clean SQL
                 clean_sql = re.sub(r"```sql\n?|```", "", raw_sql).strip()
                 if not clean_sql.upper().startswith("SELECT"):
                     match = re.search(r"SELECT.*", clean_sql, re.DOTALL | re.IGNORECASE)
@@ -183,7 +179,6 @@ with tab1:
                 st.markdown("**Generated SQL Query:**")
                 st.code(clean_sql, language="sql")
 
-                # 2. RUN QUERY
                 status_text.info("Executing query...")
                 progress_bar.progress(50)
                 
@@ -193,7 +188,6 @@ with tab1:
                 if df.empty:
                     st.warning("No records found.")
                 else:
-                    # 3. SUMMARIZE
                     status_text.info("Summarizing results...")
                     progress_bar.progress(75)
                     

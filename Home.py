@@ -6,19 +6,15 @@ import json
 import re
 from sqlalchemy import create_engine, text
 
-# Import the background processing engine
 from update_engine import run_bulk_download, run_bulk_parse, deduplicate_data, wipe_period, get_db_engine, setup_database
 
 def get_latest_parsed_date():
-    """Queries the migration log to find the most recently COMPLETED report date."""
     try:
         DB_URL = st.secrets["DB_URL"]
         engine = get_db_engine(DB_URL)
         with engine.connect() as conn:
-            # Check the migration log for the latest COMPLETED date
             result = conn.execute(text("SELECT MAX(report_date) FROM migration_log WHERE status = 'COMPLETED'")).scalar()
             if result:
-                # Format: MM/DD/YYYY
                 match = re.search(r'(\d{2})/(\d{2})/(\d{4})', str(result))
                 if match:
                     m, d, y = match.groups()
@@ -28,10 +24,8 @@ def get_latest_parsed_date():
         
     return datetime.date.today()
 
-# Setup the Home Page
 st.set_page_config(page_title="FFIEC Toolkit", page_icon="🦅", layout="centered")
 
-# W&M styled header
 st.markdown("<h1 style='text-align: center; color: #115740;'>🦅 FFIEC Toolkit</h1>", unsafe_allow_html=True)
 st.markdown("<h4 style='text-align: center; color: #222222; margin-bottom: 40px;'>Centralized Financial Institution Data Explorer</h4>", unsafe_allow_html=True)
 
@@ -66,7 +60,6 @@ update_mode = st.radio("Select Update Mode:",
 if update_mode == "Specific Date Range":
     mode_flag = "range"
     
-    # Configuration for our Quarter dropdowns
     QUARTER_MAP = {
         "Q1 (March 31)": (3, 31),
         "Q2 (June 30)": (6, 30),
@@ -75,21 +68,17 @@ if update_mode == "Specific Date Range":
     }
     quarter_options = list(QUARTER_MAP.keys())
     
-    # Configuration for our Year dropdowns (Current Year down to 2001)
     current_year = datetime.date.today().year
     year_options = list(range(current_year, 2000, -1))
     
-    # Get the smart default from JSON to pre-populate the dropdowns
     default_date = get_latest_parsed_date()
     default_year = default_date.year if default_date.year in year_options else current_year
     
-    # Determine which quarter the default date falls into
     if default_date.month <= 3: default_q_idx = 0
     elif default_date.month <= 6: default_q_idx = 1
     elif default_date.month <= 9: default_q_idx = 2
     else: default_q_idx = 3
 
-    # Layout: 4 columns side-by-side for Start and End selections
     st.markdown("##### Select Date Range")
     c1, c2, c3, c4 = st.columns(4)
     
@@ -102,17 +91,15 @@ if update_mode == "Specific Date Range":
     with c4:
         end_q = st.selectbox("End Quarter", quarter_options, index=default_q_idx)
         
-    # Translate the dropdown selections back into actual datetime objects
     start_month, start_day = QUARTER_MAP[start_q]
     start_date = datetime.date(start_year, start_month, start_day)
     
     end_month, end_day = QUARTER_MAP[end_q]
     end_date = datetime.date(end_year, end_month, end_day)
 
-    # Validation: Ensure End Date is >= Start Date
     if start_date > end_date:
         st.error(f"Invalid Range: End Date ({end_date.strftime('%m/%d/%Y')}) cannot be before Start Date ({start_date.strftime('%m/%d/%Y')}).")
-        st.stop() # Halts script execution so the download button won't run
+        st.stop()
 
 else:
     mode_flag = "smart"
@@ -121,18 +108,15 @@ else:
     end_date = None
 
 if st.button("Start Bulk Download & Parse", use_container_width=True):
-    # Setup Temporary Directory
     TEMP_DIR = os.path.join(os.getcwd(), "temp_bulk_downloads")
     if not os.path.exists(TEMP_DIR):
         os.makedirs(TEMP_DIR)
     
-    # Setup UI Elements for Progress
     status_text = st.empty()
     progress_bar = st.progress(0.0)
     
     try:
         # --- PHASE 1: DOWNLOADING ---
-        # The datetime objects from our dropdowns are formatted exactly how update_engine expects them
         str_start = start_date.strftime("%m/%d/%Y") if mode_flag == "range" else None
         str_end = end_date.strftime("%m/%d/%Y") if mode_flag == "range" else None
         
@@ -154,14 +138,11 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
 
     except Exception as e:
         status_text.error(f"❌ Process Failed: {e}")
-        st.exception(e) # Show full traceback in the app for debugging
+        st.exception(e)
 
     finally:
-        # Cleanup
-        status_text.write("Cleaning up temporary files...")
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
-        status_text.write("Cleanup complete. Ready for next task.")
 st.markdown("---")
 
 
@@ -190,7 +171,6 @@ with st.expander("Show Maintenance Tools"):
     with m_col1:
         st.markdown("### 🧹 Clean Data")
         st.write("Remove exact duplicate records from the financials table to ensure data integrity.")
-        # Fixed height spacer to align buttons
         st.markdown("<div style='height: 45px;'></div>", unsafe_allow_html=True)
 
         if st.button("Run Global Deduplication", use_container_width=True):
@@ -208,26 +188,21 @@ with st.expander("Show Maintenance Tools"):
         st.markdown("### 🔄 Reset Data")
         st.write("Wipe all data for a specific period. Use this if a download was corrupted or partial.")
 
-        # Fetch available dates with a loading indicator
         date_options = []
         with st.spinner("🔍 Checking database for available periods..."):
             try:
-                # Ensure tables exist
                 setup_database()
                 
                 DB_URL = st.secrets["DB_URL"]
                 engine = get_db_engine(DB_URL)
                 with engine.connect() as conn:
-                    # Try to get dates individually to avoid entire query failing if one table is missing
                     all_dates = set()
                     
-                    # Check financials
                     try:
                         res = conn.execute(text("SELECT DISTINCT report_date FROM call_reports_financials")).fetchall()
                         for r in res: all_dates.add(r[0])
                     except: pass
                     
-                    # Check log
                     try:
                         res = conn.execute(text("SELECT DISTINCT report_date FROM migration_log")).fetchall()
                         for r in res: all_dates.add(r[0])
