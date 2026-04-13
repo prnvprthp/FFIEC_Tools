@@ -116,18 +116,21 @@ def get_schema_context():
     """
 
 # --- AI Logic Wrapper ---
-@st.cache_data(show_spinner=False)
-def get_ai_response(engine_type, model_id, prompt, schema, _api_key=None, _url=None):
+@st.cache_resource
+def get_ai_client(api_key):
+    return genai.Client(api_key=api_key)
+
+def get_ai_response(client, model_id, prompt, schema):
     full_prompt = f"{schema}\n\nUser Question/Context: {prompt}"
-    
-    if engine_type == "Gemini (Cloud)":
-        client = genai.Client(api_key=_api_key)
-        response = client.models.generate_content(model=model_id, contents=full_prompt)
-        return response.text
-    else:
-        payload = {"model": model_id, "prompt": full_prompt, "stream": False}
-        response = requests.post(_url, json=payload, timeout=180) 
-        return response.json().get("response", "")
+    # Exponential backoff: 2s, 4s, 8s
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(model=model_id, contents=full_prompt).text
+        except Exception as e:
+            if attempt == 2: raise e
+            sleep_time = 2 ** (attempt + 1)
+            time.sleep(sleep_time)
+    return ""
 
 # --- UI Tabs ---
 tab1, tab2 = st.tabs(["AI Smart Search", "Database Statistics"])
@@ -160,17 +163,19 @@ with tab1:
             progress_bar = st.progress(0)
             status_text = st.empty()
             start_t = time.time()
-
             try:
+                # 1. GENERATE SQL
                 status_text.info("Generating SQL...")
                 progress_bar.progress(25)
                 
-                raw_sql = get_ai_response(
-                    search_engine, model_choice, user_query, get_schema_context(),
-                    _api_key=(api_key if search_engine == "Gemini (Cloud)" else None),
-                    _url=(ollama_url if search_engine == "Ollama (Local)" else None)
-                )
+                # Note: We must handle local Ollama vs Gemini logic here now
+                if search_engine == "Gemini (Cloud)":
+                    raw_sql = get_ai_response(get_ai_client(api_key), model_choice, user_query, get_schema_context())
+                else:
+                    payload = {"model": model_choice, "prompt": f"{get_schema_context()}\n\nUser Question/Context: {user_query}", "stream": False}
+                    raw_sql = requests.post(ollama_url, json=payload, timeout=180).json().get("response", "")
                 
+                # Clean SQL
                 clean_sql = re.sub(r"```sql\n?|```", "", raw_sql).strip()
                 if not clean_sql.upper().startswith("SELECT"):
                     match = re.search(r"SELECT.*", clean_sql, re.DOTALL | re.IGNORECASE)
@@ -179,6 +184,7 @@ with tab1:
                 st.markdown("**Generated SQL Query:**")
                 st.code(clean_sql, language="sql")
 
+                # 2. RUN QUERY
                 status_text.info("Executing query...")
                 progress_bar.progress(50)
                 
@@ -188,15 +194,16 @@ with tab1:
                 if df.empty:
                     st.warning("No records found.")
                 else:
+                    # 3. SUMMARIZE
                     status_text.info("Summarizing results...")
                     progress_bar.progress(75)
                     
                     summary_prompt = f"Summarize this data for the user: {df.head(5).to_string()}"
-                    answer = get_ai_response(
-                        search_engine, model_choice, summary_prompt, "Be a helpful financial analyst.",
-                        _api_key=(api_key if search_engine == "Gemini (Cloud)" else None),
-                        _url=(ollama_url if search_engine == "Ollama (Local)" else None)
-                    )
+                    if search_engine == "Gemini (Cloud)":
+                        answer = get_ai_response(get_ai_client(api_key), model_choice, summary_prompt, "Be a helpful financial analyst.")
+                    else:
+                        payload = {"model": model_choice, "prompt": f"Be a helpful financial analyst.\n\n{summary_prompt}", "stream": False}
+                        answer = requests.post(ollama_url, json=payload, timeout=180).json().get("response", "")
                     
                     progress_bar.progress(100)
                     status_text.empty()

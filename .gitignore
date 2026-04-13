@@ -40,3 +40,5 @@ coverage.xml
 .vscode/
 .idea/
 *.log
+.streamlit/secrets.toml
+.streamlit/secrets.toml
