@@ -90,6 +90,25 @@ def wipe_period(report_date):
         conn.execute(text(f"DELETE FROM {TABLE_FINANCIALS} WHERE report_date = :rd"), {"rd": report_date})
         conn.execute(text(f"DELETE FROM {TABLE_LOG} WHERE report_date = :rd"), {"rd": report_date})
 
+def process_xml_worker_by_content(xml_content, report_date):
+    rows = []
+    try:
+        root = ET.fromstring(xml_content)
+        idrssd = None
+        for elem in root.iter():
+            if elem.tag.endswith('identifier') and elem.text:
+                try: idrssd = int(elem.text); break
+                except: pass
+        if not idrssd: return [] 
+        for child in root:
+            if 'contextRef' in child.attrib:
+                concept_ref = child.tag.split('}')[-1]
+                value = child.text.strip() if child.text else None
+                if value is not None:
+                    rows.append((idrssd, report_date, concept_ref, value, child.attrib.get('unitRef'), child.attrib.get('contextRef')))
+        return rows
+    except: return []
+
 def run_bulk_parse(download_dir):
     yield ("Preparing Database...", 0.0)
     setup_database()
@@ -140,25 +159,6 @@ def run_bulk_parse(download_dir):
         with engine.begin() as conn:
             conn.execute(text(f"UPDATE {TABLE_LOG} SET status = 'COMPLETED', records_inserted = :ri WHERE report_date = :rd"), {"ri": total_rows_inserted, "rd": formatted_date})
     yield ("Done!", 1.0)
-
-def process_xml_worker_by_content(xml_content, report_date):
-    rows = []
-    try:
-        root = ET.fromstring(xml_content)
-        idrssd = None
-        for elem in root.iter():
-            if elem.tag.endswith('identifier') and elem.text:
-                try: idrssd = int(elem.text); break
-                except: pass
-        if not idrssd: return [] 
-        for child in root:
-            if 'contextRef' in child.attrib:
-                concept_ref = child.tag.split('}')[-1]
-                value = child.text.strip() if child.text else None
-                if value is not None:
-                    rows.append((idrssd, report_date, concept_ref, value, child.attrib.get('unitRef'), child.attrib.get('contextRef')))
-        return rows
-    except: return []
 
 def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
     from selenium import webdriver

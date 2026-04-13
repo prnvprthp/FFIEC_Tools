@@ -1,5 +1,8 @@
-# Streamlit secrets
-.streamlit/
+# Ignore secrets
+.streamlit/secrets.toml
+
+# Do NOT ignore config (keep themeing)
+!.streamlit/config.toml
 
 # Private environment variables
 .env
@@ -40,5 +43,3 @@ coverage.xml
 .vscode/
 .idea/
 *.log
-.streamlit/secrets.toml
-.streamlit/secrets.toml
