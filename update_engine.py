@@ -11,21 +11,28 @@ import xml.etree.ElementTree as ET
 from sqlalchemy import create_engine, text
 import streamlit as st
 
+# --- Database Configuration ---
 DB_NAME             = "ffiec_data"
 TABLE_FINANCIALS    = "call_reports_financials"
 TABLE_POR           = "call_reports_por"
 TABLE_LOG           = "migration_log"
 
 def get_db_engine(url):
-    if "tidbcloud.com" in url:
-        if "mysqlconnector" in url:
-            url = url.replace("mysqlconnector", "pymysql")
-        elif "mysql://" in url:
-            url = url.replace("mysql://", "mysql+pymysql://")
-    connect_args = {"ssl": {"fake_config": True}} if "pymysql" in url else {}
+    """Creates a SQLAlchemy engine with bulletproof TiDB/MySQL URL parsing."""
+    # Aggressively standardize the connection scheme to prevent SQLAlchemy unpacking errors
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        # If it's any variation of MySQL/TiDB, force it to be exactly mysql+pymysql
+        if "mysql" in scheme or "tidb" in scheme:
+            url = f"mysql+pymysql://{rest}"
+            
+    # Apply SSL arguments for TiDB Cloud
+    connect_args = {"ssl": {"fake_config": True}} if "tidbcloud.com" in url else {}
+    
     return create_engine(url, connect_args=connect_args)
 
 def setup_database():
+    """Creates database tables if they do not exist and fixes schema mismatches."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
@@ -40,6 +47,7 @@ def setup_database():
         except Exception: pass 
 
 def load_checkpoint():
+    """Queries the Migration Log to see which periods are TRULY completed."""
     try:
         DB_URL = st.secrets["DB_URL"]
         engine = get_db_engine(DB_URL)
@@ -50,6 +58,7 @@ def load_checkpoint():
     return {"parsed_folders": {}}
 
 def deduplicate_data():
+    """Removes exact duplicate rows using a high-speed, memory-efficient chunking strategy."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     total_removed = 0
@@ -57,7 +66,8 @@ def deduplicate_data():
         dates = outer_conn.execute(text(f"SELECT DISTINCT report_date FROM {TABLE_FINANCIALS}")).fetchall()
         report_dates = [d[0] for d in dates]
     if not report_dates:
-        yield ("No data found to deduplicate.", 1.0, 0); return
+        yield ("No data found to deduplicate.", 1.0, 0)
+        return
     with engine.begin() as conn:
         conn.execute(text("CREATE TEMPORARY TABLE temp_keep_ids (id INT PRIMARY KEY);"))
     total_periods = len(report_dates)
@@ -84,6 +94,7 @@ def deduplicate_data():
     yield (f"Success! Removed {total_removed} duplicates.", 1.0, total_removed)
 
 def wipe_period(report_date):
+    """Deletes all financial data and logs for a specific period."""
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
     with engine.begin() as conn:
@@ -91,6 +102,7 @@ def wipe_period(report_date):
         conn.execute(text(f"DELETE FROM {TABLE_LOG} WHERE report_date = :rd"), {"rd": report_date})
 
 def process_xml_worker_by_content(xml_content, report_date):
+    """Helper function to parse XML content into list of tuples."""
     rows = []
     try:
         root = ET.fromstring(xml_content)
@@ -110,6 +122,7 @@ def process_xml_worker_by_content(xml_content, report_date):
     except: return []
 
 def run_bulk_parse(download_dir):
+    """Parses downloaded zip bundles and pushes them to SQL."""
     yield ("Preparing Database...", 0.0)
     setup_database()
     checkpoint = load_checkpoint()
@@ -117,19 +130,25 @@ def run_bulk_parse(download_dir):
     if not zip_files: return
     DB_URL = st.secrets["DB_URL"]
     engine = get_db_engine(DB_URL)
+    
     for zip_idx, zip_path in enumerate(zip_files, start=1):
         base_progress = (zip_idx - 1) / len(zip_files)
         match = re.search(r'(\d{8})', os.path.basename(zip_path))
         if not match: continue
         raw_date = match.group(1)
         formatted_date = f"{raw_date[0:2]}/{raw_date[2:4]}/{raw_date[4:8]}"
+        
         if formatted_date in checkpoint.get("parsed_folders", {}): continue
+        
         with engine.begin() as conn:
             conn.execute(text(f"REPLACE INTO {TABLE_LOG} (report_date, status, records_inserted) VALUES (:rd, 'STARTED', 0)"), {"rd": formatted_date})
+            
         yield (f"Processing {formatted_date}...", base_progress)
+        
         with zipfile.ZipFile(zip_path, 'r') as z:
             all_files = z.namelist()
             por_filename = next((f for f in all_files if "POR" in f.upper() and f.endswith(".txt")), None)
+            
             if por_filename:
                 with z.open(por_filename) as f:
                     content = f.read().decode('utf-8', errors='replace')
@@ -139,33 +158,51 @@ def run_bulk_parse(download_dir):
                     if por_records:
                         with engine.begin() as conn:
                             conn.execute(text(f"REPLACE INTO {TABLE_POR} (idrssd, bank_name) VALUES (:idrssd, :bank_name)"), por_records)
+                            
             xml_files = [f for f in all_files if f.endswith(".xml")]
             total_xmls = len(xml_files); batch_buffer = []; BATCH_SIZE = 10000; total_rows_inserted = 0
+            
             for i, xml_file in enumerate(xml_files, start=1):
                 with z.open(xml_file) as f:
                     batch_buffer.extend(process_xml_worker_by_content(f.read(), formatted_date))
+                    
                 if len(batch_buffer) >= BATCH_SIZE:
                     with engine.begin() as conn:
                         sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
                         conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
-                    total_rows_inserted += len(batch_buffer); batch_buffer = []
+                    total_rows_inserted += len(batch_buffer)
+                    batch_buffer = []
+                    
                 if i % 100 == 0:
                     yield (f"({zip_idx}/{len(zip_files)}) Parsing {formatted_date}: {i}/{total_xmls} files...", base_progress + (i / total_xmls) / len(zip_files))
+                    
             if batch_buffer:
                 with engine.begin() as conn:
                     sql = text(f"INSERT INTO {TABLE_FINANCIALS} (idrssd, report_date, concept_reference, value, unit_ref, context_ref) VALUES (:idrssd, :report_date, :concept_reference, :value, :unit_ref, :context_ref)")
                     conn.execute(sql, [{"idrssd": r[0], "report_date": r[1], "concept_reference": r[2], "value": r[3], "unit_ref": r[4], "context_ref": r[5]} for r in batch_buffer])
                 total_rows_inserted += len(batch_buffer)
+                
+        # Properly Indented Block for marking completion
         with engine.begin() as conn:
             conn.execute(text(f"UPDATE {TABLE_LOG} SET status = 'COMPLETED', records_inserted = :ri WHERE report_date = :rd"), {"ri": total_rows_inserted, "rd": formatted_date})
+            
     yield ("Done!", 1.0)
 
+def get_date_objects(date_str):
+    """Helper for run_bulk_download to parse date strings."""
+    try:
+        return datetime.strptime(date_str, "%m/%d/%Y")
+    except:
+        return None
+
 def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
+    """Drives Selenium to download the zip bundles."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select, WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    
     yield ("Step 1: Configuring Headless Browser...", 0.0)
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -175,18 +212,22 @@ def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
     chrome_options.add_experimental_option("prefs", prefs)
     driver = webdriver.Chrome(options=chrome_options)
     wait = WebDriverWait(driver, 30)
+    
     try:
         yield ("Step 2: Accessing FFIEC...", 0.05)
         driver.get("https://cdr.ffiec.gov/public/pws/downloadbulkdata.aspx")
         product_dropdown = wait.until(EC.presence_of_element_located((By.ID, "ListBox1")))
         Select(product_dropdown).select_by_visible_text("Call Reports -- Single Period")
         time.sleep(2) 
+        
         xbrl_radio = wait.until(EC.element_to_be_clickable((By.ID, "XBRLRadiobutton")))
         driver.execute_script("arguments[0].click();", xbrl_radio)
         time.sleep(2) 
+        
         date_dropdown_el = wait.until(EC.presence_of_element_located((By.ID, "DatesDropDownList")))
         wait.until(lambda d: len(Select(date_dropdown_el).options) > 1) 
         all_options = [opt.text.strip() for opt in Select(date_dropdown_el).options if opt.text.strip()]
+        
         target_dates = []
         if mode == "range":
             start_dt = datetime.strptime(start_date_str, "%m/%d/%Y")
@@ -196,8 +237,10 @@ def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
             checkpoint = load_checkpoint()
             parsed_keys = checkpoint.get("parsed_folders", {}).keys()
             target_dates = [opt for opt in all_options if get_date_objects(opt) and opt not in parsed_keys]
+            
         if not target_dates:
             yield ("No new data to download.", 1.0); return
+            
         for idx, target in enumerate(target_dates):
             current_progress = (idx / len(target_dates)) * 0.9 + 0.1
             yield (f"Downloading {target}...", current_progress)
@@ -206,6 +249,10 @@ def run_bulk_download(start_date_str, end_date_str, download_dir, mode="range"):
             driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "Download_0"))
             time.sleep(2)
             while glob.glob(os.path.join(download_dir, "*.crdownload")): time.sleep(2)
+            
         yield ("Downloads complete.", 1.0)
-    except Exception as e: yield (f"Error: {e}", 1.0)
-    finally: driver.quit()
+        
+    except Exception as e: 
+        yield (f"Error: {e}", 1.0)
+    finally: 
+        driver.quit()
