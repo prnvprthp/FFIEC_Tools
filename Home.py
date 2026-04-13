@@ -127,7 +127,7 @@ if st.button("Start Bulk Download & Parse", use_container_width=True):
             
         # --- PHASE 2: PARSING & SQL PUSH ---
         status_text.info("Downloads complete. Starting XML parsing and SQL insertion...")
-        for status_msg, progress_pct, _ in run_bulk_parse(TEMP_DIR):
+        for status_msg, progress_pct in run_bulk_parse(TEMP_DIR):
             status_text.text(f"Parsing: {status_msg}")
             progress_bar.progress(0.5 + (progress_pct * 0.5))
 
